@@ -1,0 +1,72 @@
+# SWEBV-50 - frozen measurement population for Xeno CLI metric M2.3
+#
+# SELECTION RULE (PRD v2.2, S15 MEASUREMENT POPULATIONS, verbatim):
+#   "50 SWE-bench Verified instances, selected by sorting instance IDs
+#    lexicographically and taking every 10th instance from the 500-instance
+#    set. Instance ID list committed to the repo. Deterministic and
+#    reproducible."
+#
+# APPLIED AS: sort all 500 instance_id values of the `test` split with
+# Python's default string ordering (byte-wise, case-sensitive), then take
+# 0-based indices 0, 10, 20, ... 490 -> exactly 50 instances.
+#
+# SOURCE OF TRUTH: HuggingFace dataset `princeton-nlp/SWE-bench_Verified`,
+# config `default`, split `test` (500 examples, confirmed via the
+# datasets-server /info endpoint). Instance IDs retrieved 2026-08-05 via
+# https://datasets-server.huggingface.co/rows (5 pages of 100).
+#
+# FROZEN. Do not edit once measurement has begun. M2.3 reports resolved%
+# against this exact list alongside the harness config used; the PRD sets
+# NO TARGET for M2.3 - it exists for honest external comparison.
+#
+# 50 instance IDs follow, one per line.
+astropy__astropy-12907
+astropy__astropy-14365
+astropy__astropy-8707
+django__django-11095
+django__django-11211
+django__django-11477
+django__django-11790
+django__django-12050
+django__django-12308
+django__django-12858
+django__django-13128
+django__django-13363
+django__django-13568
+django__django-13810
+django__django-14034
+django__django-14349
+django__django-14559
+django__django-14792
+django__django-15128
+django__django-15380
+django__django-15572
+django__django-15930
+django__django-16145
+django__django-16502
+django__django-16667
+django__django-17087
+matplotlib__matplotlib-22719
+matplotlib__matplotlib-24570
+matplotlib__matplotlib-25775
+psf__requests-1142
+pydata__xarray-3151
+pydata__xarray-4966
+pylint-dev__pylint-4551
+pytest-dev__pytest-10051
+pytest-dev__pytest-7205
+scikit-learn__scikit-learn-10844
+scikit-learn__scikit-learn-13328
+scikit-learn__scikit-learn-14894
+scikit-learn__scikit-learn-9288
+sphinx-doc__sphinx-7454
+sphinx-doc__sphinx-8120
+sphinx-doc__sphinx-8638
+sphinx-doc__sphinx-9602
+sympy__sympy-13031
+sympy__sympy-13877
+sympy__sympy-15599
+sympy__sympy-17318
+sympy__sympy-19495
+sympy__sympy-21379
+sympy__sympy-23413

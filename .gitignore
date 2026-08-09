@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.DS_Store
+
+# Harness state. Run logs and cost ledgers are per-machine artifacts; the
+# frozen measurement suite under suite/ is committed and must NOT be ignored.
+.xeno/
+
+# Real provider credentials — never committed.
+.env
+
+# Claude Code's own local session/task state, not project source.
+.claude/
