@@ -1,11 +1,11 @@
-"""The Phase 2 state machine: Daedalus (coder) -> Talos (evaluator) ->
-Chiron (debugger) (PRD S13).
+"""The Phase 3 state machine: Argus (researcher) -> Odysseus (planner) ->
+per plan task [Argus -> Daedalus (coder) -> Talos (evaluator) -> escalation
+ladder through Chiron (debugger)] (PRD S13).
 
-Argus, Odysseus, and Cerberus do not exist yet, so the bounded escalation
-ladder (PRD S7.2) is used only through L1: L0 (re-run evaluation once) and
-L1 (Chiron patches, budget 3). When L1's budget is exhausted the run halts
-and reports rather than escalating to L2 (re-research, needs Argus). See
-`xeno.graph.build` for the exact routing.
+Cerberus (reviewer) does not exist yet (PRD S13 Phase 4), so the escalation
+ladder's L5 and every circuit breaker halt the run directly with a report
+rather than escalating to a review gate. See `xeno.graph.build` for the
+exact routing.
 """
 
 from __future__ import annotations

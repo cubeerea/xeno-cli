@@ -1,11 +1,13 @@
 """The `xeno` command (PRD S13).
 
-`xeno run` drives the Daedalus -> Talos -> Chiron graph (PRD S13 Phase 2):
-sandboxed gates, a bounded L0/L1 failure loop, on a throwaway worktree that
-is never the user's working tree. Everything needed to trust the numbers
-behind that — config, routing, prompt construction, secret scanning, the
-cost ledger — is exercised standalone by `xeno models test`, Phase 0's exit
-criterion.
+`xeno run` drives the full six-node graph (PRD S13 Phase 3): Odysseus plans
+the goal into tasks, Argus researches each one, Daedalus implements it,
+Talos's sandboxed gates evaluate it, and a bounded L0-L5 escalation ladder
+(re-run, patch, re-research, roll back and rewrite, re-plan, halt) handles
+failure — all on a throwaway worktree that is never the user's working
+tree. Everything needed to trust the numbers behind that — config, routing,
+prompt construction, secret scanning, the cost ledger — is exercised
+standalone by `xeno models test`, Phase 0's exit criterion.
 """
 
 from __future__ import annotations
@@ -343,7 +345,7 @@ def models_test(
 
 @app.command()
 def run(
-    goal: Annotated[str, typer.Argument(help="What Daedalus should implement.")],
+    goal: Annotated[str, typer.Argument(help="What the harness should accomplish.")],
     config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
     repo: Annotated[
         Path, typer.Option("--repo", help="Source repository copied into a throwaway worktree.")
@@ -352,20 +354,29 @@ def run(
         list[str] | None,
         typer.Option(
             "--file",
-            help="Existing file(s) relevant to the task, read into the codebase map. "
-            "Repeatable. There is no Argus yet (lands in Phase 3) — this is the manual "
-            "stand-in.",
+            help="Existing file(s) known to be relevant, seeded into context ahead of "
+            "Argus's own research. Repeatable. Optional — Argus (PRD S13 Phase 3) finds "
+            "context on its own; this only adds to what it finds.",
         ),
     ] = None,
 ) -> None:
-    """Run the Daedalus -> Talos -> Chiron loop on a single-file task (PRD S13).
+    """Plan and execute `goal` with the full six-node graph (PRD S13 Phase 3).
 
-    Operates on a throwaway copy of `repo` under .xeno/worktrees/<run_id>,
-    never the user's working tree. Talos's and Chiron's gates run inside a
-    sandboxed container (PRD S11, S13 Phase 2) — zero host execution of
-    generated code. This is the R1 test command: point medium's chain at a
-    local model and run a single-file task end to end.
+    Odysseus breaks the goal into a plan of tasks; each task is researched by
+    Argus, implemented by Daedalus, and evaluated by Talos's sandboxed gates
+    (PRD S11) — zero host execution of generated code. A failing task climbs
+    a bounded ladder (patch, re-research, roll back and rewrite, re-plan)
+    before the run halts with a report. Operates on a throwaway copy of
+    `repo` under .xeno/worktrees/<run_id>, never the user's working tree.
     """
+    if shutil.which("git") is None:
+        console.print(
+            "[red]error:[/] git was not found on PATH — required for the checkpoint "
+            "substrate (PRD S13 Phase 3: every completed task is a commit, and a failed "
+            "one rolls back to the last one)"
+        )
+        raise typer.Exit(code=2)
+
     config = _resolve_config(config_path)
     for warning in _capability_warnings(config):
         console.print(f"[yellow]warning:[/] {warning}")
@@ -446,7 +457,7 @@ def run(
             router.close()
             pool.shutdown()
             docker_client.close()
-            ok = bool(final_state and final_state.eval_report and final_state.eval_report.passed)
+            ok = bool(final_state and _run_succeeded(final_state))
             runlog.event(EventKind.RUN_END, ok=ok)
 
     cost_path = ledger.write(paths.cost)
@@ -454,8 +465,20 @@ def run(
     _print_run_summary(final_state, worktree)
     _print_ledger_summary(ledger, cost_path)
 
-    if not (final_state.eval_report and final_state.eval_report.passed):
+    if not _run_succeeded(final_state):
         raise typer.Exit(code=1)
+
+
+def _run_succeeded(state: AgentState) -> bool:
+    """Every plan task checkpointed and the run never halted.
+
+    Distinct from Phase 2's only definition of success ("the last
+    eval_report passed"): the last report reflects whichever task the run
+    stopped on — the final task on a genuine multi-task success, but
+    whatever task got stuck on a halt. Comparing `task_cursor` against
+    `task_count` is what actually answers "did the whole plan complete."
+    """
+    return not state.halted and state.task_count > 0 and state.task_cursor >= state.task_count
 
 
 def _copy_into_worktree(repo_root: Path, worktree: Path, config: XenoConfig) -> None:
@@ -467,10 +490,22 @@ def _copy_into_worktree(repo_root: Path, worktree: Path, config: XenoConfig) -> 
 
 def _print_run_summary(state: AgentState, worktree: Path) -> None:
     report = state.eval_report
-    if state.halted and not (report and report.passed):
+    if state.halted:
         console.print(Panel(f"[red]halted:[/] {state.halt_reason}", title="run result"))
-    elif report and report.passed:
-        console.print(Panel("[green]passed[/] — all gates green", title="run result"))
+    elif _run_succeeded(state):
+        console.print(
+            Panel(
+                f"[green]passed[/] — {state.task_count}/{state.task_count} plan task(s) complete",
+                title="run result",
+            )
+        )
+
+    console.print(f"plan progress: {state.task_cursor}/{state.task_count} task(s) checkpointed")
+    if state.checkpoints:
+        cp_table = Table("task", "commit", "message", title="checkpoints")
+        for cp in state.checkpoints:
+            cp_table.add_row(str(cp.task_index), cp.sha[:12], cp.message)
+        console.print(cp_table)
 
     if report is not None:
         table = Table("gate", "result", title="evaluation")

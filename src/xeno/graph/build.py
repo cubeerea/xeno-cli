@@ -1,14 +1,15 @@
-"""The Phase 2 graph: Daedalus -> Talos -> Chiron, sandboxed, with a bounded
-L0/L1 failure loop (PRD S7.2, S13 Phase 2).
+"""The full six-node graph (PRD S13 Phase 3): Argus (skeleton) -> Odysseus
+(plan) -> [per task: Argus (research) -> Daedalus -> Talos -> escalation
+ladder] -> next task or done.
 
-L2 (re-research), L3 (rollback + rewrite), L4 (re-plan), and L5 (halt to
-Cerberus) all name nodes or substrates — Argus, a checkpoint mechanism,
-Odysseus, Cerberus — that do not exist until Phase 3/4 (PRD S13: "Debugger
-(Chiron) node; ladder rungs L0 and L1" is the whole of Phase 2's ladder
-scope). When Chiron's L1 budget is exhausted, the run halts and reports
-rather than escalating further. This is the same kind of phase-scoped
-substitution Phase 1 made when it stood a rewrite loop in for L1 before
-Chiron existed — just one rung later now that Chiron is real.
+The escalation ladder (PRD S7.2) is monotonic within a task
+(`AgentState.ladder_rung`'s docstring): L0 (re-run evaluation) -> L1 (Chiron
+patches, budget 3) -> L2 (Argus re-researches, then Chiron patches again,
+budget 2) -> L3 (roll back to the last checkpoint, Daedalus rewrites from
+scratch, budget 2) -> L4 (Odysseus re-plans the stuck task, then a single
+research-and-rewrite attempt) -> L5 (halt with a report). There is no
+Cerberus yet (PRD S13 Phase 4), so L5 and every breaker trip halt the run
+directly rather than escalating to a review gate.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from xeno.adapters.base import LanguageAdapter
+from xeno.core import vcs
 from xeno.core.breakers import (
     BreakerPanel,
     Intervention,
@@ -29,10 +31,13 @@ from xeno.core.breakers import (
 from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.runlog import EventKind, RunLog
-from xeno.core.state import AgentState
-from xeno.core.types import RUNG_BUDGETS
+from xeno.core.state import AgentState, Handle
+from xeno.core.types import RUNG_BUDGETS, LadderRung
+from xeno.graph.argus import make_argus_nodes
+from xeno.graph.checkpoints import checkpoint_step, rollback_step
 from xeno.graph.chiron import make_chiron_node
 from xeno.graph.daedalus import make_daedalus_node
+from xeno.graph.odysseus import make_odysseus_node
 from xeno.graph.talos import make_talos_node
 from xeno.prompt.keys import DEFAULT_IGNORES, CacheKeyring
 from xeno.router.router import Router
@@ -40,15 +45,33 @@ from xeno.sandbox.pool import WarmPool
 
 _L0_RUNG = 0
 _L1_RUNG = 1
+_L2_RUNG = 2
+_L3_RUNG = 3
+_L4_RUNG = 4
+_MAX_BUDGETED_RUNG = max(RUNG_BUDGETS)  # 4: L4 is the last rung with a budget; beyond it is L5/halt
+_RUNG_LABELS = tuple(rung.value for rung in LadderRung)  # index n -> "L{n}"
 
-_RouteAfterTalos = Literal["retry_eval", "patch", "done", "halt"]
+_RouteAfterTalos = Literal[
+    "retry_eval", "patch", "research_l2", "rollback_l3", "replan_l4", "next_task", "done", "halt"
+]
 _RouteAfterWrite = Literal["evaluate", "halt"]
+_RouteAfterOdysseus = Literal["research", "halt"]
+_RouteAfterArgusSkeleton = Literal["plan", "halt"]
+_RouteAfterArgusResearch = Literal["daedalus", "chiron", "halt"]
+
+_ROUTE_BY_RUNG: dict[int, _RouteAfterTalos] = {
+    _L0_RUNG: "retry_eval",
+    _L1_RUNG: "patch",
+    _L2_RUNG: "research_l2",
+    _L3_RUNG: "rollback_l3",
+    _L4_RUNG: "replan_l4",
+}
 
 
 class _LoopContext:
-    """Bookkeeping shared by reference between the write nodes, the Talos
-    node, and the routing functions — the only things that need to agree on
-    "what just happened" (PRD S7.3)."""
+    """Bookkeeping shared by reference between nodes and the routing
+    functions — the only things that need to agree on "what just happened"
+    (PRD S7.3) or "what did Argus find" (PRD S13 Phase 3)."""
 
     def __init__(self, worktree: Path) -> None:
         self.intervention = Intervention.NONE
@@ -59,10 +82,35 @@ class _LoopContext:
         #: SINCE THE START of this run (not merely since the last write).
         self.last_snapshot = _snapshot(worktree)
         self.created_this_run: set[str] = set()
+        #: Argus's most recent repo-skeleton Handle. Odysseus reads this by
+        #: reference (`xeno.graph.odysseus`'s docstring explains why it is
+        #: not an `AgentState` field): a one-shot planning aid, not
+        #: something any other node ever needs again.
+        self.skeleton_handle: Handle | None = None
 
     def set_chiron_result(self, declined: bool, reason: str) -> None:
         self.chiron_declined = declined
         self.chiron_decline_reason = reason
+
+    def set_skeleton(self, handle: Handle) -> None:
+        self.skeleton_handle = handle
+
+    def get_skeleton(self) -> Handle | None:
+        return self.skeleton_handle
+
+    def resync_after_rollback(self, worktree: Path) -> None:
+        """L3 (PRD S7.2) discards worktree state out from under this
+        context's bookkeeping via `git reset --hard` + `git clean -fd` — a
+        mutation the write nodes did not make. `_after_write`'s CB-6
+        accounting (PRD S7.4) is otherwise keyed off whatever it last saw,
+        so without this it keeps comparing against a pre-rollback snapshot
+        for the rest of the task: harmless on its own (the illegal-removal
+        check already treats anything upstream `created_this_run` as fair
+        game to disappear), but it lets staleness accumulate across L3's
+        multiple rollback attempts for no reason. Resetting here keeps the
+        bookkeeping an honest reflection of the actual worktree."""
+        self.last_snapshot = _snapshot(worktree)
+        self.created_this_run &= self.last_snapshot
 
 
 def build_graph(
@@ -76,11 +124,31 @@ def build_graph(
     pool: WarmPool,
     adapter: LanguageAdapter,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
-    """Compile the three-node graph."""
+    """Compile the seven-node graph."""
     touched_files: list[Path] = []
     ctx = _LoopContext(worktree)
     breaker_panel = BreakerPanel(config.limits)
 
+    #: PRD S13 Phase 3's minimal git substrate: one commit of the run's
+    #: starting state, so L3's first rollback (before any checkpoint exists
+    #: yet) has a target.
+    initial_sha = vcs.init_repo(worktree)
+
+    argus_skeleton, argus_research = make_argus_nodes(
+        router=router,
+        config=config,
+        keyring=keyring,
+        paths=paths,
+        worktree=worktree,
+        publish_skeleton=ctx.set_skeleton,
+    )
+    odysseus = make_odysseus_node(
+        router=router,
+        config=config,
+        keyring=keyring,
+        paths=paths,
+        skeleton=ctx.get_skeleton,
+    )
     daedalus = make_daedalus_node(
         router=router,
         config=config,
@@ -147,6 +215,30 @@ def build_graph(
             trip = breaker_panel.trip(state, verdict)
             runlog.event(EventKind.BREAKER_FIRED, code=trip.code.value, detail=trip.detail)
 
+    def _node_step(name: str, fn: Any) -> Any:
+        """Wrap a node with the enter/exit logging every node gets — the
+        deterministic steps (rollback) and every model-calling node share
+        this, so it is factored out once rather than repeated per node."""
+
+        def step(state: AgentState) -> AgentState:
+            runlog.event(EventKind.NODE_ENTER, node=name)
+            state = fn(state)
+            runlog.event(EventKind.NODE_EXIT, node=name, halted=state.halted)
+            return state
+
+        return step
+
+    argus_skeleton_step = _node_step("argus_skeleton", argus_skeleton)
+    odysseus_step = _node_step("odysseus", odysseus)
+    argus_research_step = _node_step("argus_research", argus_research)
+
+    def rollback_node(state: AgentState) -> AgentState:
+        runlog.event(EventKind.NODE_ENTER, node="rollback")
+        rollback_step(state, worktree, initial_sha=initial_sha)
+        ctx.resync_after_rollback(worktree)
+        runlog.event(EventKind.NODE_EXIT, node="rollback")
+        return state
+
     def daedalus_step(state: AgentState) -> AgentState:
         runlog.event(EventKind.NODE_ENTER, node="daedalus")
         state = daedalus(state)
@@ -187,7 +279,16 @@ def build_graph(
         state = talos(state)
         passed = state.eval_report.passed if state.eval_report else None
         runlog.event(EventKind.NODE_EXIT, node="talos", passed=passed)
-        if not passed:
+        if passed:
+            checkpoint_step(state, worktree)
+            runlog.event(
+                EventKind.CHECKPOINT,
+                task_index=state.checkpoints[-1].task_index,
+                sha=state.checkpoints[-1].sha,
+                task_cursor=state.task_cursor,
+                task_count=state.task_count,
+            )
+        elif not state.halted:
             _advance_ladder(state)
         return state
 
@@ -211,8 +312,10 @@ def build_graph(
 
         if report.infrastructure_failure:
             # PRD S10: infra failures get one L0 retry, then straight to
-            # ESCALATE — never a patch, since there is no code defect for
-            # Chiron to fix. Phase 2 has no Cerberus, so ESCALATE == halt.
+            # ESCALATE — never a patch/re-research/rewrite, since there is
+            # no CODE defect for any of Argus/Chiron/Daedalus/Odysseus to
+            # act on. Phase 3 still has no Cerberus (PRD S13 Phase 4), so
+            # ESCALATE == halt regardless of how many ladder rungs exist.
             if state.ladder_rung == _L0_RUNG and state.rung_attempts < RUNG_BUDGETS[_L0_RUNG]:
                 state.rung_attempts += 1
                 ctx.intervention = Intervention.NONE
@@ -223,37 +326,50 @@ def build_graph(
             )
             return
 
-        if state.ladder_rung == _L0_RUNG:
-            if state.rung_attempts < RUNG_BUDGETS[_L0_RUNG]:
-                state.rung_attempts += 1
+        rung = state.ladder_rung
+        if state.rung_attempts < RUNG_BUDGETS[rung]:
+            state.rung_attempts += 1
+            if rung == _L0_RUNG:
                 ctx.intervention = Intervention.NONE
-                runlog.event(EventKind.LADDER_ADVANCE, rung="L0")
-                return
-            state.ladder_rung = _L1_RUNG
-            state.rung_attempts = 1
-            runlog.event(EventKind.LADDER_ADVANCE, rung="L1")
-            return
-
-        if state.ladder_rung == _L1_RUNG:
-            if state.rung_attempts < RUNG_BUDGETS[_L1_RUNG]:
-                state.rung_attempts += 1
-                runlog.event(EventKind.LADDER_ADVANCE, rung="L1", attempt=state.rung_attempts)
-                return
-            state.halt_reason = (
-                f"failure signature {state.failure_signature} survived the L1 patch "
-                f"budget ({RUNG_BUDGETS[_L1_RUNG]} attempts); Phase 2 has no Argus to "
-                "hand off to for L2 (PRD S13)"
+            runlog.event(
+                EventKind.LADDER_ADVANCE, rung=_RUNG_LABELS[rung], attempt=state.rung_attempts
             )
             return
 
-        # Unreachable: no code path in this module sets ladder_rung outside
-        # {0, 1}. Guarded rather than assumed, so a future edit that adds a
-        # third rung fails loudly here instead of looping silently.
-        state.halt_reason = f"unhandled ladder rung {state.ladder_rung}"
+        if rung >= _MAX_BUDGETED_RUNG:
+            # Monotonic ladder (PRD, `AgentState.ladder_rung`'s docstring):
+            # L4's one re-plan attempt is already spent by having reached
+            # here at all. No re-descent through L0-L3 with fresh budgets —
+            # that would make the breaker guarantee of bounded attempts
+            # meaningless. Straight to L5.
+            state.halt_reason = (
+                f"failure signature {state.failure_signature} survived every ladder rung "
+                f"through {_RUNG_LABELS[rung]} (PRD S7.2); halting at L5"
+            )
+            return
+
+        state.ladder_rung = rung + 1
+        state.rung_attempts = 1
+        runlog.event(EventKind.LADDER_ADVANCE, rung=_RUNG_LABELS[state.ladder_rung])
 
     def route_after_write(state: AgentState) -> _RouteAfterWrite:
         """Pure read of state the write step already committed. No mutation."""
         return "halt" if state.halted else "evaluate"
+
+    def route_after_odysseus(state: AgentState) -> _RouteAfterOdysseus:
+        return "halt" if state.halted else "research"
+
+    def route_after_argus_skeleton(state: AgentState) -> _RouteAfterArgusSkeleton:
+        return "halt" if state.halted else "plan"
+
+    def route_after_argus_research(state: AgentState) -> _RouteAfterArgusResearch:
+        """L2 (PRD S7.2) is the only rung where Argus hands off to Chiron
+        rather than Daedalus — a fresh task (rung 0) and an L4 re-plan
+        (rung 4, `xeno.graph.odysseus` already turned it back into a
+        from-scratch write) both want a full Daedalus write."""
+        if state.halted:
+            return "halt"
+        return "chiron" if state.ladder_rung == _L2_RUNG else "daedalus"
 
     def route_after_talos(state: AgentState) -> _RouteAfterTalos:
         """Pure read of state `talos_step` already committed. No mutation."""
@@ -262,20 +378,46 @@ def build_graph(
         report = state.eval_report
         assert report is not None, "talos always sets eval_report before returning"
         if report.passed:
-            return "done"
-        return "retry_eval" if state.ladder_rung == _L0_RUNG else "patch"
+            return "next_task" if state.task_cursor < state.task_count else "done"
+        return _ROUTE_BY_RUNG[state.ladder_rung]
 
     graph = StateGraph(AgentState)
+    graph.add_node("argus_skeleton", argus_skeleton_step)
+    graph.add_node("odysseus", odysseus_step)
+    graph.add_node("argus_research", argus_research_step)
     graph.add_node("daedalus", daedalus_step)
     graph.add_node("chiron", chiron_step)
+    graph.add_node("rollback", rollback_node)
     graph.add_node("talos", talos_step)
-    graph.add_edge(START, "daedalus")
+
+    graph.add_edge(START, "argus_skeleton")
+    graph.add_conditional_edges(
+        "argus_skeleton", route_after_argus_skeleton, {"plan": "odysseus", "halt": END}
+    )
+    graph.add_conditional_edges(
+        "odysseus", route_after_odysseus, {"research": "argus_research", "halt": END}
+    )
+    graph.add_conditional_edges(
+        "argus_research",
+        route_after_argus_research,
+        {"daedalus": "daedalus", "chiron": "chiron", "halt": END},
+    )
     graph.add_conditional_edges("daedalus", route_after_write, {"evaluate": "talos", "halt": END})
     graph.add_conditional_edges("chiron", route_after_write, {"evaluate": "talos", "halt": END})
+    graph.add_edge("rollback", "daedalus")
     graph.add_conditional_edges(
         "talos",
         route_after_talos,
-        {"retry_eval": "talos", "patch": "chiron", "done": END, "halt": END},
+        {
+            "retry_eval": "talos",
+            "patch": "chiron",
+            "research_l2": "argus_research",
+            "rollback_l3": "rollback",
+            "replan_l4": "odysseus",
+            "next_task": "argus_research",
+            "done": END,
+            "halt": END,
+        },
     )
     return graph.compile()
 
@@ -306,7 +448,7 @@ def run_graph(
     # Bounded independently of CB-1: this is LangGraph's own step counter, a
     # backstop against a routing bug looping forever rather than a tuning
     # knob — CB-1's much lower per-task/per-run caps fire first in practice.
-    result = compiled.invoke(state, config={"recursion_limit": 200})
+    result = compiled.invoke(state, config={"recursion_limit": 1000})
     return result if isinstance(result, AgentState) else AgentState.model_validate(result)
 
 
