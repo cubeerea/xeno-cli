@@ -21,6 +21,7 @@ from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.plan import Plan, PlanTask, read_plan, write_plan
 from xeno.graph.prompts import (
+    ODYSSEUS_CERBERUS_REJECT_PREFIX,
     ODYSSEUS_FORMAT_CORRECTION,
     ODYSSEUS_REPLAN_PREFIX,
     ODYSSEUS_SYSTEM,
@@ -40,12 +41,24 @@ _MAX_FORMAT_ATTEMPTS = 2
 _L4_RUNG = 4
 
 
-def _build_current_turn(state: AgentState, skeleton_text: str, *, is_replan: bool) -> str:
+def _build_current_turn(
+    state: AgentState, skeleton_text: str, *, is_l4_replan: bool, is_cerberus_reject: bool
+) -> str:
     lines = [f"Goal: {state.goal}"]
     if skeleton_text:
         lines += ["", "Repository structure:", skeleton_text]
 
-    if not is_replan:
+    if is_cerberus_reject:
+        # E17 (PRD S8.3): every task already passed Talos's gates, so there is
+        # no `eval_report` failure to describe — the objection is Cerberus's
+        # own written verdict, not a gate result.
+        assert state.cerberus_notes is not None, "a PLANNER rejection always carries objections"
+        lines.append("")
+        lines.append(ODYSSEUS_CERBERUS_REJECT_PREFIX)
+        lines.append(state.cerberus_notes.read_text())
+        return "\n".join(lines)
+
+    if not is_l4_replan:
         return "\n".join(lines)
 
     report = state.eval_report
@@ -87,10 +100,15 @@ def make_odysseus_node(
         nonlocal call_index
         call_index += 1
 
-        is_replan = state.ladder_rung == _L4_RUNG
+        is_l4_replan = state.ladder_rung == _L4_RUNG
+        is_cerberus_reject = state.reject_destination is NodeRole.PLANNER
+        is_replan = is_l4_replan or is_cerberus_reject
+        state.reject_destination = None
         skeleton_handle = skeleton()
         skeleton_text = skeleton_handle.read_text() if skeleton_handle else ""
-        current_turn = _build_current_turn(state, skeleton_text, is_replan=is_replan)
+        current_turn = _build_current_turn(
+            state, skeleton_text, is_l4_replan=is_l4_replan, is_cerberus_reject=is_cerberus_reject
+        )
 
         output = None
         for attempt in range(_MAX_FORMAT_ATTEMPTS):

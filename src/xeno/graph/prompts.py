@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from xeno.core.types import NodeRole, Verdict
 from xeno.graph.plan import PlanTask
 
 #: SOURCE writes only, no shell, no tests, no package installs (PRD S10:
@@ -48,6 +49,18 @@ Rules:
   requirements the user never gave you, do not guess. Respond with exactly:
   <xeno-objection>a one-sentence explanation of what is missing</xeno-objection>
   and nothing else. Never ask the user a question directly.
+"""
+
+#: Sent only when this call is Cerberus's E16 REJECT_AND_RETURN (PRD S8.3):
+#: a fully green run was reviewed and rejected on implementation grounds.
+#: Distinct from the plain `state.goal` turn because the ask here is "fix
+#: this specific objection," not "implement this task from scratch."
+DAEDALUS_CERBERUS_REJECTION_PREFIX = """\
+Cerberus, the reviewer, examined the completed diff for this goal and
+rejected it on implementation grounds. Fix the objection below — do not
+redo work that was not objected to.
+
+Cerberus's objection:
 """
 
 #: A corrective follow-up turn, not a system-prompt change: sent only after a
@@ -306,6 +319,21 @@ your last chance to make it achievable; if it still cannot succeed, say so
 plainly in the task itself rather than deferring the problem again.
 """
 
+#: Sent only when this call is Cerberus's E17 REJECT_AND_RETURN (PRD S8.3):
+#: a fully green run was reviewed and rejected on plan grounds. Distinct from
+#: `ODYSSEUS_REPLAN_PREFIX` (L4, a single stuck task exhausted its ladder
+#: budget): here EVERY task already passed Talos's gates, and the problem is
+#: that the plan as a whole did not accomplish the goal Cerberus judged it
+#: against — this call appends task(s), it does not revise a stuck one.
+ODYSSEUS_CERBERUS_REJECT_PREFIX = """\
+Cerberus, the reviewer, examined the completed diff for this goal and
+rejected it on plan grounds: the work as planned does not accomplish the
+goal. The tasks already completed stay as they are. Add the task(s) needed
+to resolve Cerberus's objection below.
+
+Cerberus's objection:
+"""
+
 ODYSSEUS_FORMAT_CORRECTION = """\
 Your previous response did not use the required format — no <xeno-task> or
 <xeno-objection> tag was found, so no plan could be recorded. Resend your
@@ -483,5 +511,165 @@ def parse_argus_research_output(text: str) -> ArgusResearchOutput:
             "Argus's response contained neither a valid <xeno-file> tag nor "
             "<xeno-no-files>; treating as no additional context found."
         ),
+        malformed=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cerberus (reviewer, PRD S8, S13 Phase 4)
+# ---------------------------------------------------------------------------
+
+#: Flagship tier (PRD S9.1) — this is a subjective, holistic call
+#: ("does this diff accomplish the stated goal", not "does it pass"), the
+#: one place in the graph a green Talos is necessary but not sufficient.
+#: Only reached once a task loop already produced a fully green run (PRD
+#: S8.2) — `xeno.graph.cerberus` skips this call entirely and reports
+#: deterministically when it is entered already-halted (an L5 or breaker
+#: escalation with nothing left to judge).
+CERBERUS_SYSTEM = """\
+You are Cerberus, the reviewer node in the Xeno CLI harness (PRD S8, S10).
+You are the ONLY component in this system whose output is ever shown
+directly to a human, and the only one that writes to git.
+
+Every deterministic gate (parse, lint, types, tests) has already passed —
+that is necessary but NOT sufficient. Your job is the holistic judgment a
+gate cannot make: does this diff actually accomplish the stated goal? Is the
+design sound, or did the coder work around the problem instead of solving
+it? Are there security issues? Does it match the codebase's existing
+conventions? Were any tests deleted or weakened just to make them pass? Is
+there dead code, swallowed exceptions, hardcoded secrets, or abandoned
+TODOs? You may reject a diff where every test passes.
+
+Do not explain your reasoning outside the tags below. Your entire response
+is machine-parsed by a program that only understands the tags below — prose
+anywhere else is a parse failure, not a helpful aside.
+
+Respond with exactly one verdict, in exactly one of these three shapes:
+
+  APPROVE — the diff is ready to ship as-is:
+  <xeno-verdict>approve</xeno-verdict>
+  <xeno-commit-message>
+  type(scope): short imperative summary
+
+  A short body explaining WHY this change was made, not a restatement of
+  the diff.
+  </xeno-commit-message>
+  <xeno-notes>optional one or two sentences for the human confirming this</xeno-notes>
+
+  REJECT AND RETURN — the problem is real but fixable without a human:
+  <xeno-verdict>reject_and_return</xeno-verdict>
+  <xeno-destination>daedalus</xeno-destination>
+  <xeno-objections>
+  specific, actionable objections — enough for the destination node to
+  understand exactly what is wrong and what "fixed" looks like
+  </xeno-objections>
+  Use `daedalus` in <xeno-destination> when the CODE is wrong (a bug, a
+  missed edge case, bad style, a security issue) — the plan itself was fine.
+  Use `odysseus` when the PLAN itself is wrong (a task was misconceived, a
+  step is missing, the wrong problem was solved) — the code correctly
+  implemented a flawed plan.
+
+  ESCALATE — the call genuinely depends on information only a human has:
+  <xeno-verdict>escalate</xeno-verdict>
+  <xeno-report>
+  Restate the goal. Summarize what was attempted. State the specific
+  blocking question. Recommend one concrete next action.
+  </xeno-report>
+
+Rules:
+- Reject rather than approve anything you are not confident about.
+- ESCALATE is for genuine human-only judgment calls, not a way to avoid a
+  call you are equipped to make yourself.
+- The commit message MUST follow conventional-commit format
+  (type(scope): summary) with the "why" in the body, since it becomes the
+  permanent record of this change.
+"""
+
+CERBERUS_FORMAT_CORRECTION = """\
+Your previous response did not use the required format — no valid
+<xeno-verdict> block was found (or a required field for that verdict was
+missing), so no decision could be recorded. Resend your answer using ONLY
+the tag format from the system prompt: no explanation, no numbered steps,
+no markdown code fences, just the tag(s) and their content.
+"""
+
+_VERDICT_RE = re.compile(r"<xeno-verdict>(.*?)</xeno-verdict>", re.DOTALL)
+_COMMIT_MESSAGE_RE = re.compile(
+    r"<xeno-commit-message>\n?(.*?)\n?</xeno-commit-message>", re.DOTALL
+)
+_CERBERUS_NOTES_RE = re.compile(r"<xeno-notes>(.*?)</xeno-notes>", re.DOTALL)
+_DESTINATION_RE = re.compile(r"<xeno-destination>(.*?)</xeno-destination>", re.DOTALL)
+_OBJECTIONS_RE = re.compile(r"<xeno-objections>\n?(.*?)\n?</xeno-objections>", re.DOTALL)
+_REPORT_RE = re.compile(r"<xeno-report>\n?(.*?)\n?</xeno-report>", re.DOTALL)
+
+_DESTINATION_BY_NAME = {"daedalus": NodeRole.CODER, "odysseus": NodeRole.PLANNER}
+
+#: Mirrors `CommitRef.message`'s cap (`xeno.core.state`) — the message ends
+#: up on a real git commit either way.
+_MAX_COMMIT_MESSAGE_CHARS = 2000
+
+
+@dataclass(frozen=True, slots=True)
+class CerberusOutput:
+    verdict: Verdict | None
+    commit_message: str | None = None
+    notes: str | None = None
+    destination: NodeRole | None = None
+    objections: str | None = None
+    report: str | None = None
+    #: True only for the harness's own "no usable verdict" fallback: an
+    #: unrecognized/missing <xeno-verdict>, or a verdict missing one of its
+    #: own required fields (e.g. `approve` with no commit message). Unlike
+    #: every other node's parser, there is no separate escape-hatch tag here
+    #: — ESCALATE already IS this node's escape hatch, so a malformed
+    #: response has nowhere safe to fall but the caller's own forced
+    #: ESCALATE (`xeno.graph.cerberus`).
+    malformed: bool = False
+
+
+def parse_cerberus_output(text: str) -> CerberusOutput:
+    """Parse Cerberus's response into one of three verdicts.
+
+    Required fields are verdict-conditional: APPROVE needs a commit message,
+    REJECT_AND_RETURN needs a recognized destination and objections,
+    ESCALATE needs a report. A missing verdict, an unrecognized verdict, or
+    a verdict missing its own required field(s) all fall through to the same
+    `malformed=True` result — there is no partial-credit verdict to act on.
+    """
+    verdict_match = _VERDICT_RE.search(text)
+    verdict_name = verdict_match.group(1).strip().lower() if verdict_match else None
+
+    if verdict_name == Verdict.APPROVE.value:
+        message = _COMMIT_MESSAGE_RE.search(text)
+        if message:
+            notes = _CERBERUS_NOTES_RE.search(text)
+            return CerberusOutput(
+                verdict=Verdict.APPROVE,
+                commit_message=message.group(1).strip()[:_MAX_COMMIT_MESSAGE_CHARS],
+                notes=notes.group(1).strip() if notes else None,
+            )
+
+    elif verdict_name == Verdict.REJECT_AND_RETURN.value:
+        destination_match = _DESTINATION_RE.search(text)
+        objections = _OBJECTIONS_RE.search(text)
+        destination = (
+            _DESTINATION_BY_NAME.get(destination_match.group(1).strip().lower())
+            if destination_match
+            else None
+        )
+        if destination is not None and objections:
+            return CerberusOutput(
+                verdict=Verdict.REJECT_AND_RETURN,
+                destination=destination,
+                objections=objections.group(1).strip(),
+            )
+
+    elif verdict_name == Verdict.ESCALATE.value:
+        report = _REPORT_RE.search(text)
+        if report:
+            return CerberusOutput(verdict=Verdict.ESCALATE, report=report.group(1).strip())
+
+    return CerberusOutput(
+        verdict=None,
         malformed=True,
     )

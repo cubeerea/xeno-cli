@@ -1,10 +1,11 @@
 """The `xeno` command (PRD S13).
 
-`xeno run` drives the full six-node graph (PRD S13 Phase 3): Odysseus plans
-the goal into tasks, Argus researches each one, Daedalus implements it,
-Talos's sandboxed gates evaluate it, and a bounded L0-L5 escalation ladder
+`xeno run` drives the full six-node graph (PRD S13 Phase 3-4): Odysseus
+plans the goal into tasks, Argus researches each one, Daedalus implements
+it, Talos's sandboxed gates evaluate it, a bounded L0-L5 escalation ladder
 (re-run, patch, re-research, roll back and rewrite, re-plan, halt) handles
-failure — all on a throwaway worktree that is never the user's working
+failure, and Cerberus reviews the completed diff — the sole human gate
+(PRD S8.1) — all on a throwaway worktree that is never the user's working
 tree. Everything needed to trust the numbers behind that — config, routing,
 prompt construction, secret scanning, the cost ledger — is exercised
 standalone by `xeno models test`, Phase 0's exit criterion.
@@ -15,16 +16,18 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import docker
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 
 from xeno import __version__
 from xeno.adapters.python import PythonAdapter
+from xeno.core import vcs
 from xeno.core.config import (
     CONFIG_FILENAME,
     ConfigError,
@@ -32,10 +35,10 @@ from xeno.core.config import (
     load_config,
 )
 from xeno.core.ledger import CostLedger
-from xeno.core.paths import RunPaths, new_run_id
+from xeno.core.paths import RunPaths, new_run_id, short_run_id, slugify
 from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState, Handle
-from xeno.core.types import CALLSIGNS, NodeRole, Tier
+from xeno.core.types import CALLSIGNS, NodeRole, Tier, Verdict
 from xeno.graph import run_graph
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
@@ -360,14 +363,18 @@ def run(
         ),
     ] = None,
 ) -> None:
-    """Plan and execute `goal` with the full six-node graph (PRD S13 Phase 3).
+    """Plan and execute `goal` with the full six-node graph (PRD S13 Phase 3-4).
 
     Odysseus breaks the goal into a plan of tasks; each task is researched by
     Argus, implemented by Daedalus, and evaluated by Talos's sandboxed gates
     (PRD S11) — zero host execution of generated code. A failing task climbs
     a bounded ladder (patch, re-research, roll back and rewrite, re-plan)
-    before the run halts with a report. Operates on a throwaway copy of
-    `repo` under .xeno/worktrees/<run_id>, never the user's working tree.
+    before the run halts. Once every task is done (or the run halts),
+    Cerberus reviews the diff and either approves it (you confirm, then it's
+    squashed onto a dedicated branch and optionally opened as a PR),
+    escalates it to you with a report, or sends it back into the loop with
+    written objections. Operates on a throwaway copy of `repo` under
+    .xeno/worktrees/<run_id>, never the user's working tree.
     """
     if shutil.which("git") is None:
         console.print(
@@ -384,6 +391,12 @@ def run(
         console.print(
             "[yellow]warning:[/] sandbox network policy is 'open' (PRD S11.2) — "
             "generated code has unrestricted egress for this run"
+        )
+    if config.git.open_pr and shutil.which("gh") is None:
+        console.print(
+            "[yellow]warning:[/] git.open_pr is true but gh was not found on PATH — "
+            "PR creation will be skipped at the end of this run; the squashed commit "
+            "will still land on the preserved local branch."
         )
 
     run_id = new_run_id()
@@ -452,12 +465,13 @@ def run(
                 state=state,
                 pool=pool,
                 adapter=adapter,
+                repo_root=repo_root,
             )
         finally:
             router.close()
             pool.shutdown()
             docker_client.close()
-            ok = bool(final_state and _run_succeeded(final_state))
+            ok = bool(final_state and final_state.review_verdict is Verdict.APPROVE)
             runlog.event(EventKind.RUN_END, ok=ok)
 
     cost_path = ledger.write(paths.cost)
@@ -465,7 +479,47 @@ def run(
     _print_run_summary(final_state, worktree)
     _print_ledger_summary(ledger, cost_path)
 
-    if not _run_succeeded(final_state):
+    #: Mirrors `build_graph`'s own branch-name formula exactly (goal, run_id,
+    #: `config.git.branch_prefix`) — recomputed here rather than threaded
+    #: back through `run_graph`'s return value, since it's a pure function of
+    #: inputs `run()` already has.
+    branch = f"{config.git.branch_prefix}{slugify(goal)}-{short_run_id(run_id)}"
+
+    if final_state.review_verdict is Verdict.APPROVE:
+        decision = _human_gate(final_state, worktree, branch)
+        if decision == "approve":
+            assert final_state.commit_message is not None
+            since = vcs.root_commit(worktree)
+            vcs.squash_to_one_commit(worktree, since=since, message=final_state.commit_message)
+            console.print(f"[green]squashed[/] onto {branch}")
+            if config.git.open_pr:
+                pushed = vcs.push_branch(worktree, branch)
+                pr_url = (
+                    vcs.open_pr(
+                        worktree,
+                        branch=branch,
+                        title=final_state.commit_message.splitlines()[0],
+                        body=final_state.commit_message,
+                    )
+                    if pushed
+                    else None
+                )
+                if pr_url:
+                    console.print(f"[green]opened PR:[/] {pr_url}")
+                else:
+                    console.print(
+                        "[yellow]warning:[/] PR creation was skipped or failed — the "
+                        f"squashed commit is still on the preserved branch {branch}."
+                    )
+        else:
+            console.print(
+                f"[yellow]declined by human — branch preserved, un-squashed:[/] {branch}"
+            )
+            raise typer.Exit(code=1)
+    elif final_state.review_verdict is Verdict.ESCALATE:
+        _print_escalate_report(final_state, branch)
+        raise typer.Exit(code=1)
+    elif not _run_succeeded(final_state):
         raise typer.Exit(code=1)
 
 
@@ -479,6 +533,66 @@ def _run_succeeded(state: AgentState) -> bool:
     `task_count` is what actually answers "did the whole plan complete."
     """
     return not state.halted and state.task_count > 0 and state.task_cursor >= state.task_count
+
+
+def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["approve", "reject"]:
+    """The one human confirmation the whole system ever asks for (PRD S8.1):
+    reached only on Cerberus's own APPROVE. This is a genuine veto distinct
+    from Cerberus's REJECT_AND_RETURN — REJECT_AND_RETURN already happened
+    automatically, before the human was ever consulted, and re-enters the
+    graph; a human "reject" here does not — it leaves the branch preserved
+    exactly like an ESCALATE, since APPROVE having already happened means
+    there is nothing left to route back into.
+    """
+    assert state.review_diff_handle is not None
+    assert state.cerberus_notes is not None
+    assert state.commit_message is not None
+
+    console.print(Panel(state.commit_message, title="proposed commit message"))
+    console.print(Panel(state.cerberus_notes.read_text(), title="Cerberus's notes"))
+    console.print(f"diff: {state.review_diff_handle.path} ({state.review_diff_handle.bytes} bytes)")
+    console.print(f"branch: {branch}")
+
+    while True:
+        choice = Prompt.ask(
+            "Approve this change?", choices=["approve", "reject", "inspect"], default="inspect"
+        )
+        if choice == "inspect":
+            with console.pager():
+                console.print(state.review_diff_handle.read_text())
+            continue
+        return "approve" if choice == "approve" else "reject"
+
+
+def _print_escalate_report(state: AgentState, branch: str) -> None:
+    """PRD S8.3 ESCALATE: no action prompt beyond acknowledgment — the human
+    decides offline whether to intervene, redirect, or abandon. `None`
+    `cerberus_notes` means Cerberus itself failed (PRD S8.2 "Failure"): the
+    harness never auto-approves in the absence of a review, so this is
+    labeled UNREVIEWED rather than presented as a normal report.
+    """
+    if state.cerberus_notes is None:
+        console.print(
+            Panel(
+                f"halt reason: {state.halt_reason}\n\n"
+                "Cerberus itself could not complete a review (its model chain was "
+                "exhausted). This diff has NOT been reviewed by anyone.",
+                title="[bold red]UNREVIEWED[/]",
+            )
+        )
+    else:
+        console.print(Panel(state.cerberus_notes.read_text(), title="Cerberus's escalation report"))
+
+    if state.review_diff_handle is not None:
+        console.print(
+            f"diff: {state.review_diff_handle.path} ({state.review_diff_handle.bytes} bytes)"
+        )
+    if state.eval_report is not None:
+        console.print(f"last evaluation: {state.eval_report}")
+    if state.checkpoints:
+        last = state.checkpoints[-1]
+        console.print(f"last green checkpoint: {last.sha[:12]} (task {last.task_index})")
+    console.print(f"branch preserved for inspection: {branch}")
 
 
 def _copy_into_worktree(repo_root: Path, worktree: Path, config: XenoConfig) -> None:
@@ -639,6 +753,11 @@ limits:
   max_iterations_per_run: 60
   max_rejections_per_run: 2
   max_deleted_lines: 200
+
+git:
+  branch_prefix: "xeno/"
+  squash_per_run: true   # v1 always squashes per-run (PRD OQ-4)
+  open_pr: false          # set true + install `gh` to open a PR on APPROVE
 
 caching:
   enabled: true

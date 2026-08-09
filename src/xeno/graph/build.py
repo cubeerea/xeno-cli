@@ -1,15 +1,22 @@
-"""The full six-node graph (PRD S13 Phase 3): Argus (skeleton) -> Odysseus
-(plan) -> [per task: Argus (research) -> Daedalus -> Talos -> escalation
-ladder] -> next task or done.
+"""The full eight-node graph (PRD S13 Phase 3-4): Argus (skeleton) ->
+Odysseus (plan) -> [per task: Argus (research) -> Daedalus -> Talos ->
+escalation ladder] -> Cerberus -> done or reject-and-return.
 
 The escalation ladder (PRD S7.2) is monotonic within a task
 (`AgentState.ladder_rung`'s docstring): L0 (re-run evaluation) -> L1 (Chiron
 patches, budget 3) -> L2 (Argus re-researches, then Chiron patches again,
 budget 2) -> L3 (roll back to the last checkpoint, Daedalus rewrites from
 scratch, budget 2) -> L4 (Odysseus re-plans the stuck task, then a single
-research-and-rewrite attempt) -> L5 (halt with a report). There is no
-Cerberus yet (PRD S13 Phase 4), so L5 and every breaker trip halt the run
-directly rather than escalating to a review gate.
+research-and-rewrite attempt) -> L5 (halt).
+
+Cerberus is the sole human gate (PRD S8.1): every "halt" edge label in this
+graph, and `route_after_talos`'s "done" label, target the Cerberus node
+rather than `END` — "every node's failure mode routes to Cerberus, never to
+the user." Cerberus itself resolves to APPROVE/ESCALATE (both terminal,
+routed to `END`; the actual human interaction happens in `xeno.cli` after
+`run_graph` returns) or REJECT_AND_RETURN (non-terminal, PRD S8.3: routes
+back to Daedalus or Odysseus with written objections, budgeted separately
+from the ladder via `AgentState.reject_count`).
 """
 
 from __future__ import annotations
@@ -29,11 +36,12 @@ from xeno.core.breakers import (
     record_diff,
 )
 from xeno.core.config import XenoConfig
-from xeno.core.paths import RunPaths
+from xeno.core.paths import RunPaths, short_run_id, slugify
 from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState, Handle
-from xeno.core.types import RUNG_BUDGETS, LadderRung
+from xeno.core.types import RUNG_BUDGETS, LadderRung, NodeRole, Verdict
 from xeno.graph.argus import make_argus_nodes
+from xeno.graph.cerberus import make_cerberus_node
 from xeno.graph.checkpoints import checkpoint_step, rollback_step
 from xeno.graph.chiron import make_chiron_node
 from xeno.graph.daedalus import make_daedalus_node
@@ -58,6 +66,7 @@ _RouteAfterWrite = Literal["evaluate", "halt"]
 _RouteAfterOdysseus = Literal["research", "halt"]
 _RouteAfterArgusSkeleton = Literal["plan", "halt"]
 _RouteAfterArgusResearch = Literal["daedalus", "chiron", "halt"]
+_RouteAfterCerberus = Literal["reject_daedalus", "reject_odysseus", "human"]
 
 _ROUTE_BY_RUNG: dict[int, _RouteAfterTalos] = {
     _L0_RUNG: "retry_eval",
@@ -123,16 +132,27 @@ def build_graph(
     runlog: RunLog,
     pool: WarmPool,
     adapter: LanguageAdapter,
+    goal: str,
+    repo_root: Path,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
-    """Compile the seven-node graph."""
+    """Compile the eight-node graph."""
     touched_files: list[Path] = []
     ctx = _LoopContext(worktree)
     breaker_panel = BreakerPanel(config.limits)
 
     #: PRD S13 Phase 3's minimal git substrate: one commit of the run's
     #: starting state, so L3's first rollback (before any checkpoint exists
-    #: yet) has a target.
+    #: yet) has a target — and also the squash boundary Cerberus/the CLI
+    #: diff and squash against (PRD S8.4).
     initial_sha = vcs.init_repo(worktree)
+
+    #: PRD S8.4: every run operates on its own dedicated branch. Created
+    #: right after `init_repo` so the whole run, including any L3 rollback,
+    #: happens on it rather than a detached/default one.
+    branch = f"{config.git.branch_prefix}{slugify(goal)}-{short_run_id(paths.run_id)}"
+    vcs.create_branch(worktree, branch)
+    if config.git.open_pr:
+        vcs.inherit_origin_remote(worktree, repo_root)
 
     argus_skeleton, argus_research = make_argus_nodes(
         router=router,
@@ -178,6 +198,14 @@ def build_graph(
         breaker_panel=breaker_panel,
         runlog=runlog,
         intervention=lambda: ctx.intervention,
+    )
+    cerberus = make_cerberus_node(
+        router=router,
+        config=config,
+        keyring=keyring,
+        paths=paths,
+        worktree=worktree,
+        initial_sha=initial_sha,
     )
 
     def _after_write(state: AgentState) -> None:
@@ -231,6 +259,17 @@ def build_graph(
     argus_skeleton_step = _node_step("argus_skeleton", argus_skeleton)
     odysseus_step = _node_step("odysseus", odysseus)
     argus_research_step = _node_step("argus_research", argus_research)
+
+    def cerberus_step(state: AgentState) -> AgentState:
+        runlog.event(EventKind.NODE_ENTER, node="cerberus")
+        state = cerberus(state)
+        runlog.event(
+            EventKind.VERDICT,
+            verdict=state.review_verdict.value if state.review_verdict else None,
+            reject_count=state.reject_count,
+        )
+        runlog.event(EventKind.NODE_EXIT, node="cerberus", halted=state.halted)
+        return state
 
     def rollback_node(state: AgentState) -> AgentState:
         runlog.event(EventKind.NODE_ENTER, node="rollback")
@@ -381,6 +420,17 @@ def build_graph(
             return "next_task" if state.task_cursor < state.task_count else "done"
         return _ROUTE_BY_RUNG[state.ladder_rung]
 
+    def route_after_cerberus(state: AgentState) -> _RouteAfterCerberus:
+        """Cerberus's own node always resolves to one of the three verdicts
+        before returning — unlike every other route function here, this does
+        not check `state.halted` first, because the review IS the
+        resolution of any halt, not a pass-through of one (PRD S8.3)."""
+        if state.review_verdict is Verdict.REJECT_AND_RETURN:
+            if state.reject_destination is NodeRole.CODER:
+                return "reject_daedalus"
+            return "reject_odysseus"
+        return "human"
+
     graph = StateGraph(AgentState)
     graph.add_node("argus_skeleton", argus_skeleton_step)
     graph.add_node("odysseus", odysseus_step)
@@ -389,21 +439,26 @@ def build_graph(
     graph.add_node("chiron", chiron_step)
     graph.add_node("rollback", rollback_node)
     graph.add_node("talos", talos_step)
+    graph.add_node("cerberus", cerberus_step)
 
     graph.add_edge(START, "argus_skeleton")
     graph.add_conditional_edges(
-        "argus_skeleton", route_after_argus_skeleton, {"plan": "odysseus", "halt": END}
+        "argus_skeleton", route_after_argus_skeleton, {"plan": "odysseus", "halt": "cerberus"}
     )
     graph.add_conditional_edges(
-        "odysseus", route_after_odysseus, {"research": "argus_research", "halt": END}
+        "odysseus", route_after_odysseus, {"research": "argus_research", "halt": "cerberus"}
     )
     graph.add_conditional_edges(
         "argus_research",
         route_after_argus_research,
-        {"daedalus": "daedalus", "chiron": "chiron", "halt": END},
+        {"daedalus": "daedalus", "chiron": "chiron", "halt": "cerberus"},
     )
-    graph.add_conditional_edges("daedalus", route_after_write, {"evaluate": "talos", "halt": END})
-    graph.add_conditional_edges("chiron", route_after_write, {"evaluate": "talos", "halt": END})
+    graph.add_conditional_edges(
+        "daedalus", route_after_write, {"evaluate": "talos", "halt": "cerberus"}
+    )
+    graph.add_conditional_edges(
+        "chiron", route_after_write, {"evaluate": "talos", "halt": "cerberus"}
+    )
     graph.add_edge("rollback", "daedalus")
     graph.add_conditional_edges(
         "talos",
@@ -415,9 +470,14 @@ def build_graph(
             "rollback_l3": "rollback",
             "replan_l4": "odysseus",
             "next_task": "argus_research",
-            "done": END,
-            "halt": END,
+            "done": "cerberus",
+            "halt": "cerberus",
         },
+    )
+    graph.add_conditional_edges(
+        "cerberus",
+        route_after_cerberus,
+        {"reject_daedalus": "argus_research", "reject_odysseus": "odysseus", "human": END},
     )
     return graph.compile()
 
@@ -433,6 +493,7 @@ def run_graph(
     state: AgentState,
     pool: WarmPool,
     adapter: LanguageAdapter,
+    repo_root: Path,
 ) -> AgentState:
     """Compile and run the graph to completion, returning the final state."""
     compiled = build_graph(
@@ -444,6 +505,8 @@ def run_graph(
         runlog=runlog,
         pool=pool,
         adapter=adapter,
+        goal=state.goal,
+        repo_root=repo_root,
     )
     # Bounded independently of CB-1: this is LangGraph's own step counter, a
     # backstop against a routing bug looping forever rather than a tuning

@@ -7,8 +7,10 @@ toward prose/fences is a real failure mode discovered against a live model
 
 from __future__ import annotations
 
+from xeno.core.types import NodeRole, Verdict
 from xeno.graph.prompts import (
     parse_argus_research_output,
+    parse_cerberus_output,
     parse_chiron_output,
     parse_daedalus_output,
     parse_odysseus_output,
@@ -157,3 +159,104 @@ def test_argus_prose_with_no_tags_is_malformed_no_files() -> None:
     assert out.malformed
     assert out.files == ()
     assert out.no_files_reason is not None
+
+
+def test_cerberus_parses_approve() -> None:
+    text = (
+        "<xeno-verdict>approve</xeno-verdict>\n"
+        "<xeno-commit-message>\nfeat: add widget\n\n"
+        "Why: users asked for it.\n</xeno-commit-message>\n"
+        "<xeno-notes>looks good</xeno-notes>"
+    )
+    out = parse_cerberus_output(text)
+    assert not out.malformed
+    assert out.verdict is Verdict.APPROVE
+    assert out.commit_message == "feat: add widget\n\nWhy: users asked for it."
+    assert out.notes == "looks good"
+
+
+def test_cerberus_approve_without_notes() -> None:
+    text = (
+        "<xeno-verdict>approve</xeno-verdict>\n<xeno-commit-message>fix: bug</xeno-commit-message>"
+    )
+    out = parse_cerberus_output(text)
+    assert not out.malformed
+    assert out.verdict is Verdict.APPROVE
+    assert out.commit_message == "fix: bug"
+    assert out.notes is None
+
+
+def test_cerberus_approve_missing_commit_message_is_malformed() -> None:
+    out = parse_cerberus_output("<xeno-verdict>approve</xeno-verdict>")
+    assert out.malformed
+    assert out.verdict is None
+
+
+def test_cerberus_parses_reject_and_return_to_daedalus() -> None:
+    text = (
+        "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+        "<xeno-destination>daedalus</xeno-destination>\n"
+        "<xeno-objections>\nthe error is swallowed silently\n</xeno-objections>"
+    )
+    out = parse_cerberus_output(text)
+    assert not out.malformed
+    assert out.verdict is Verdict.REJECT_AND_RETURN
+    assert out.destination is NodeRole.CODER
+    assert out.objections == "the error is swallowed silently"
+
+
+def test_cerberus_parses_reject_and_return_to_odysseus() -> None:
+    text = (
+        "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+        "<xeno-destination>odysseus</xeno-destination>\n"
+        "<xeno-objections>the plan never covers the rate-limit reset</xeno-objections>"
+    )
+    out = parse_cerberus_output(text)
+    assert out.destination is NodeRole.PLANNER
+
+
+def test_cerberus_reject_unknown_destination_is_malformed() -> None:
+    text = (
+        "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+        "<xeno-destination>talos</xeno-destination>\n"
+        "<xeno-objections>bad</xeno-objections>"
+    )
+    out = parse_cerberus_output(text)
+    assert out.malformed
+
+
+def test_cerberus_reject_missing_objections_is_malformed() -> None:
+    text = (
+        "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+        "<xeno-destination>daedalus</xeno-destination>"
+    )
+    out = parse_cerberus_output(text)
+    assert out.malformed
+
+
+def test_cerberus_parses_escalate() -> None:
+    text = (
+        "<xeno-verdict>escalate</xeno-verdict>\n"
+        "<xeno-report>\nthis needs a human call\n</xeno-report>"
+    )
+    out = parse_cerberus_output(text)
+    assert not out.malformed
+    assert out.verdict is Verdict.ESCALATE
+    assert out.report == "this needs a human call"
+
+
+def test_cerberus_escalate_missing_report_is_malformed() -> None:
+    out = parse_cerberus_output("<xeno-verdict>escalate</xeno-verdict>")
+    assert out.malformed
+
+
+def test_cerberus_unknown_verdict_is_malformed() -> None:
+    out = parse_cerberus_output("<xeno-verdict>maybe</xeno-verdict>")
+    assert out.malformed
+    assert out.verdict is None
+
+
+def test_cerberus_prose_with_no_tags_is_malformed() -> None:
+    out = parse_cerberus_output("I think this looks fine overall...")
+    assert out.malformed
+    assert out.verdict is None

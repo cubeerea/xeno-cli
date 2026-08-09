@@ -25,6 +25,7 @@ from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
 from xeno.graph.prompts import (
+    DAEDALUS_CERBERUS_REJECTION_PREFIX,
     DAEDALUS_FORMAT_CORRECTION,
     DAEDALUS_SYSTEM,
     DaedalusOutput,
@@ -56,6 +57,19 @@ def _compute_diff(worktree: Path, touched: list[Path], before: dict[Path, str]) 
     return "\n".join(chunks)
 
 
+def _build_current_turn(state: AgentState) -> str:
+    """Ordinary task work is just the goal. A Cerberus E16 REJECT_AND_RETURN
+    (PRD S8.3) appends the reviewer's objections instead — a fully green run
+    was rejected on implementation grounds, so this call is a targeted fix,
+    not a from-scratch implementation."""
+    if state.reject_destination is not NodeRole.CODER:
+        return state.goal
+    assert state.cerberus_notes is not None, "a CODER rejection always carries objections"
+    return "\n".join(
+        [state.goal, "", DAEDALUS_CERBERUS_REJECTION_PREFIX, state.cerberus_notes.read_text()]
+    )
+
+
 def make_daedalus_node(
     *,
     router: Router,
@@ -85,7 +99,8 @@ def make_daedalus_node(
         focus = [h.path for h in state.context_handles] or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
 
-        current_turn = state.goal
+        current_turn = _build_current_turn(state)
+        state.reject_destination = None
 
         output: DaedalusOutput | None = None
         for attempt in range(_MAX_FORMAT_ATTEMPTS):

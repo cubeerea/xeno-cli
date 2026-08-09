@@ -17,7 +17,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from xeno.core.types import BreakerCode, Breakpoint, Tier, Verdict
+from xeno.core.types import BreakerCode, Breakpoint, NodeRole, Tier, Verdict
 
 #: PRD S6.3 HARD RULE: no AgentState field may exceed this serialized size.
 #: Anything larger is a Handle.
@@ -223,6 +223,32 @@ class AgentState(BaseModel):
     review_verdict: Verdict | None = None
     halt_reason: str | None = None
     breaker_trips: list[BreakerTrip] = Field(default_factory=list)
+
+    #: Cerberus's full accumulated run diff (PRD S8.2), recomputed on every
+    #: Cerberus invocation via `vcs.diff_since` — never `diff_handle`, which
+    #: stays the LAST write's diff only (still needed by CB-5). Set on both
+    #: the reviewed and the deterministic-escalate branches, so the CLI can
+    #: always show "the current diff" once the graph terminates.
+    review_diff_handle: Handle | None = None
+
+    #: Cerberus's written prose, reused across all three verdicts: APPROVE's
+    #: notes, REJECT_AND_RETURN's objections, or ESCALATE's report. `None`
+    #: only when an ESCALATE was forced by Cerberus's own chain exhaustion
+    #: (PRD S8.2 "Failure") — that absence IS the UNREVIEWED signal, so no
+    #: separate boolean field is needed for it.
+    cerberus_notes: Handle | None = None
+
+    #: Cerberus's proposed conventional-commit message (APPROVE only).
+    #: Inline, not a Handle: comfortably under the 4 KB field limit, and the
+    #: squash step needs the raw string directly.
+    commit_message: str | None = None
+
+    #: Cerberus's E16/E17 routing choice on REJECT_AND_RETURN: `CODER`
+    #: (Daedalus, implementation flaw) or `PLANNER` (Odysseus, plan flaw).
+    #: Written once by the Cerberus node; the node that reads it (Daedalus or
+    #: Odysseus) clears it back to `None` immediately after, so a later,
+    #: unrelated call to that same node can never misread a stale value.
+    reject_destination: NodeRole | None = None
 
     @model_validator(mode="after")
     def _enforce_field_size(self) -> Self:

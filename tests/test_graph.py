@@ -30,12 +30,12 @@ from xeno.core.ledger import CostLedger
 from xeno.core.paths import RunPaths
 from xeno.core.runlog import NullRunLog
 from xeno.core.state import AgentState
-from xeno.core.types import DEFAULT_NODE_TIERS, NodeRole, Tier
+from xeno.core.types import DEFAULT_NODE_TIERS, NodeRole, Tier, Verdict
 from xeno.core.usage import Usage
 from xeno.graph.build import run_graph
 from xeno.graph.gates import GateOutcome
 from xeno.prompt.keys import CacheKeyring
-from xeno.router.providers.base import CompletionResult, Provider
+from xeno.router.providers.base import CompletionResult, Provider, ProviderError
 from xeno.router.router import Router
 from xeno.sandbox.pool import WarmPool
 
@@ -50,6 +50,20 @@ PLANNER_TWO_TASKS = (
 )
 ARGUS_SKELETON_TEXT = "A small Python package with no existing modules."
 ARGUS_NO_FILES = "<xeno-no-files>nothing to reference yet</xeno-no-files>"
+CERBERUS_APPROVE = (
+    "<xeno-verdict>approve</xeno-verdict>\n"
+    "<xeno-commit-message>feat: test change</xeno-commit-message>"
+)
+CERBERUS_REJECT_DAEDALUS = (
+    "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+    "<xeno-destination>daedalus</xeno-destination>\n"
+    "<xeno-objections>fix the bug</xeno-objections>"
+)
+CERBERUS_REJECT_ODYSSEUS = (
+    "<xeno-verdict>reject_and_return</xeno-verdict>\n"
+    "<xeno-destination>odysseus</xeno-destination>\n"
+    "<xeno-objections>the plan misses a step</xeno-objections>"
+)
 
 
 def _mod_write(value: int) -> str:
@@ -82,6 +96,8 @@ class ScriptedProvider(Provider):
         daedalus_text: str | Callable[[], str] = DAEDALUS_OK,
         triage_text: str = "triaged",
         chiron_text: str | Callable[[], str] = CHIRON_PATCH_OK,
+        reviewer_text: str | Callable[[], str] = CERBERUS_APPROVE,
+        fail_reviewer: bool = False,
     ) -> None:
         super().__init__(name, spec)
         self.planner_text = planner_text
@@ -90,6 +106,11 @@ class ScriptedProvider(Provider):
         self.daedalus_text = daedalus_text
         self.triage_text = triage_text
         self.chiron_text = chiron_text
+        self.reviewer_text = reviewer_text
+        #: Forces every REVIEWER call to raise a non-retryable ProviderError,
+        #: exhausting the (single-entry) chain — the UNREVIEWED path (PRD
+        #: S8.2 "Failure"): Cerberus's own model call failed outright.
+        self.fail_reviewer = fail_reviewer
         self.cache_capable = True
         self.calls: list[NodeRole] = []
 
@@ -106,6 +127,14 @@ class ScriptedProvider(Provider):
                 text = self.skeleton_text
             else:
                 text = self.research_text() if callable(self.research_text) else self.research_text
+        elif prompt.node is NodeRole.REVIEWER:
+            if self.fail_reviewer:
+                # `retryable=True` so the router walks the chain rather than
+                # re-raising immediately — with this fixture's single-entry
+                # FLAGSHIP chain, walking it IS exhausting it, which is what
+                # raises the `ChainExhaustedError` `cerberus.py` catches.
+                raise ProviderError("simulated flagship outage", provider=self.name, retryable=True)
+            text = self.reviewer_text() if callable(self.reviewer_text) else self.reviewer_text
         else:
             text = self.triage_text
         return CompletionResult(
@@ -210,6 +239,8 @@ def _run(
     research_text: str | Callable[[], str] = ARGUS_NO_FILES,
     daedalus_text: str | Callable[[], str] = DAEDALUS_OK,
     chiron_text: str | Callable[[], str] = CHIRON_PATCH_OK,
+    reviewer_text: str | Callable[[], str] = CERBERUS_APPROVE,
+    fail_reviewer: bool = False,
     pool: object | None = None,
     adapter: LanguageAdapter | None = None,
 ) -> tuple[AgentState, ScriptedProvider]:
@@ -223,6 +254,8 @@ def _run(
         research_text=research_text,
         daedalus_text=daedalus_text,
         chiron_text=chiron_text,
+        reviewer_text=reviewer_text,
+        fail_reviewer=fail_reviewer,
     )
     router._providers["ollama"] = fake
     keyring = CacheKeyring(run_id="t", worktree_root=worktree)
@@ -237,6 +270,7 @@ def _run(
         state=state,
         pool=pool or FakePool(),  # type: ignore[arg-type]
         adapter=adapter or PythonAdapter(),
+        repo_root=run_paths.repo_root,
     )
     return final, fake
 
@@ -300,13 +334,15 @@ def test_happy_path_passes_with_real_sandbox_and_gates(
     assert final.task_count == 1
     assert final.task_cursor == 1
     assert len(final.checkpoints) == 1
-    # Skeleton, plan, per-task research, then the one write — no failure, so
-    # no triage call and no Chiron call was ever made.
+    assert final.review_verdict is Verdict.APPROVE
+    # Skeleton, plan, per-task research, the one write, then Cerberus's
+    # review — no failure, so no triage call and no Chiron call was ever made.
     assert fake.calls == [
         NodeRole.RESEARCHER,
         NodeRole.PLANNER,
         NodeRole.RESEARCHER,
         NodeRole.CODER,
+        NodeRole.REVIEWER,
     ]
 
 
@@ -762,3 +798,188 @@ def test_two_task_plan_checkpoints_each_task_and_advances_the_cursor(
     assert fake.calls.count(NodeRole.DEBUGGER) == 0  # both tasks pass on the first try
     # skeleton (once) + one research call per task
     assert fake.calls.count(NodeRole.RESEARCHER) == 3
+
+
+# ---- Phase 4: Cerberus, the human gate (PRD S8, S13) -----------------------
+
+
+def test_e15_approve_reviews_the_diff_and_reaches_a_terminal_approve(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _script_gates(monkeypatch, [pass_outcome()])
+    final, fake = _run(graph_config, worktree, run_paths)
+
+    assert not final.halted
+    assert final.review_verdict is Verdict.APPROVE
+    assert final.commit_message == "feat: test change"
+    assert final.cerberus_notes is not None
+    assert final.review_diff_handle is not None
+    assert "x = 1" in final.review_diff_handle.read_text()
+    assert fake.calls.count(NodeRole.REVIEWER) == 1
+
+
+def test_l5_halt_reaches_cerberus_and_escalates_with_no_model_call(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E12 (PRD S8.3): Cerberus does not judge an already-halted run, it
+    reports — deterministically, spending no FLAGSHIP call."""
+    _script_gates(monkeypatch, [fail_outcome(signature=str(i)) for i in range(10)])
+    daedalus_counter = iter(range(1, 20))
+    chiron_counter = iter(range(100, 120))
+    final, fake = _run(
+        graph_config,
+        worktree,
+        run_paths,
+        daedalus_text=lambda: _mod_write(next(daedalus_counter)),
+        chiron_text=lambda: _mod_write(next(chiron_counter)),
+    )
+
+    assert final.halted
+    assert final.ladder_rung == 4
+    assert final.review_verdict is Verdict.ESCALATE
+    assert final.cerberus_notes is not None
+    assert "L4" in final.cerberus_notes.read_text()
+    assert final.review_diff_handle is not None
+    assert fake.calls.count(NodeRole.REVIEWER) == 0  # deterministic report, no model call
+
+
+def test_breaker_trip_reaches_cerberus_and_escalates_with_no_model_call(
+    providers: dict[str, ProviderSpec],
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E13 (PRD S8.3): a circuit breaker trip is also handed to Cerberus,
+    not straight to the caller — same deterministic, no-model-call report."""
+    from xeno.core.config import ModelSpec, NodeSpec
+
+    config = XenoConfig(
+        providers=providers,
+        tiers={
+            Tier.FLAGSHIP: (ModelSpec(provider="ollama", model="big"),),
+            Tier.MEDIUM: (ModelSpec(provider="ollama", model="qwen2.5-coder:14b"),),
+            Tier.LIGHT: (ModelSpec(provider="ollama", model="qwen2.5-coder:7b"),),
+        },
+        nodes={role: NodeSpec(tier=tier) for role, tier in DEFAULT_NODE_TIERS.items()},
+        limits=Limits(max_iterations_per_task=1),
+    )
+    _script_gates(monkeypatch, [fail_outcome(signature=str(i)) for i in range(6)])
+    final, fake = _run(config, worktree, run_paths)
+
+    assert final.halted
+    assert final.halt_reason is not None
+    assert final.halt_reason.startswith("CB-1")
+    assert final.review_verdict is Verdict.ESCALATE
+    assert final.cerberus_notes is not None
+    assert "CB-1" in final.cerberus_notes.read_text()
+    assert fake.calls.count(NodeRole.REVIEWER) == 0
+
+
+def test_e16_reject_to_daedalus_appends_a_task_and_the_run_still_completes(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _script_gates(monkeypatch, [pass_outcome(), pass_outcome()])
+    reviewer_responses = iter([CERBERUS_REJECT_DAEDALUS, CERBERUS_APPROVE])
+    final, fake = _run(
+        graph_config, worktree, run_paths, reviewer_text=lambda: next(reviewer_responses)
+    )
+
+    assert not final.halted
+    assert final.review_verdict is Verdict.APPROVE
+    assert final.reject_count == 1
+    assert final.reject_destination is None  # cleared once Daedalus consumed it
+    assert final.task_count == 2  # the original task plus Cerberus's appended one
+    assert len(final.checkpoints) == 2
+    assert fake.calls.count(NodeRole.REVIEWER) == 2
+    assert fake.calls.count(NodeRole.CODER) == 2  # original write + the fix
+    assert fake.calls.count(NodeRole.PLANNER) == 1  # never routed to Odysseus
+
+
+def test_e17_reject_to_odysseus_replans_and_the_run_still_completes(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _script_gates(monkeypatch, [pass_outcome(), pass_outcome()])
+    reviewer_responses = iter([CERBERUS_REJECT_ODYSSEUS, CERBERUS_APPROVE])
+    planner_responses = iter(
+        [
+            PLANNER_SINGLE_TASK,
+            '<xeno-task acceptance="pkg/mod2.py exists and gates pass">'
+            "write pkg/mod2.py</xeno-task>",
+        ]
+    )
+    daedalus_responses = iter([DAEDALUS_OK, '<xeno-file path="pkg/mod2.py">y = 1\n</xeno-file>'])
+    final, fake = _run(
+        graph_config,
+        worktree,
+        run_paths,
+        reviewer_text=lambda: next(reviewer_responses),
+        planner_text=lambda: next(planner_responses),
+        daedalus_text=lambda: next(daedalus_responses),
+    )
+
+    assert not final.halted
+    assert final.review_verdict is Verdict.APPROVE
+    assert final.reject_count == 1
+    assert final.reject_destination is None  # cleared once Odysseus consumed it
+    assert final.task_count == 2  # completed task kept, one new task appended
+    assert len(final.checkpoints) == 2
+    assert fake.calls.count(NodeRole.REVIEWER) == 2
+    assert fake.calls.count(NodeRole.PLANNER) == 2  # initial plan + the E17 replan
+    assert (worktree / "pkg" / "mod2.py").read_text() == "y = 1"
+
+
+def test_reject_budget_exhaustion_converts_the_third_rejection_to_escalate(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD S8.3: `max_rejections_per_run` (default 2, `Limits()`'s default)
+    — the rejection BEYOND budget converts to ESCALATE without touching
+    `ladder_rung`, a budget entirely separate from the escalation ladder."""
+    _script_gates(monkeypatch, [pass_outcome(), pass_outcome(), pass_outcome()])
+    reviewer_responses = iter(
+        [CERBERUS_REJECT_DAEDALUS, CERBERUS_REJECT_DAEDALUS, CERBERUS_REJECT_DAEDALUS]
+    )
+    final, fake = _run(
+        graph_config, worktree, run_paths, reviewer_text=lambda: next(reviewer_responses)
+    )
+
+    assert final.halted
+    assert final.review_verdict is Verdict.ESCALATE
+    assert final.reject_count == 2  # Limits().max_rejections_per_run
+    assert final.ladder_rung == 0  # the reject budget never touches the ladder
+    assert final.task_count == 3  # original + 2 appended-then-rejected-again tasks
+    assert len(final.checkpoints) == 3
+    assert fake.calls.count(NodeRole.REVIEWER) == 3
+
+
+def test_cerberus_chain_exhaustion_escalates_as_unreviewed(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD S8.2 'Failure': the harness must never auto-approve in the
+    absence of a review. A `None` `cerberus_notes` on an ESCALATE IS the
+    UNREVIEWED signal."""
+    _script_gates(monkeypatch, [pass_outcome()])
+    final, fake = _run(graph_config, worktree, run_paths, fail_reviewer=True)
+
+    assert final.halted
+    assert final.review_verdict is Verdict.ESCALATE
+    assert final.cerberus_notes is None
+    assert final.review_diff_handle is not None  # still computed before the call was attempted
+    assert fake.calls.count(NodeRole.REVIEWER) == 1  # the attempt was made and failed
