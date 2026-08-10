@@ -12,6 +12,7 @@ flat, additive, and never rewritten in place.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -28,7 +29,6 @@ class EventKind(StrEnum):
     RUN_END = "run.end"
     NODE_ENTER = "node.enter"
     NODE_EXIT = "node.exit"
-    EDGE_TAKEN = "edge.taken"
     MODEL_CALL = "model.call"
     MODEL_ERROR = "model.error"
     TIER_ESCALATION = "tier.escalation"
@@ -39,7 +39,6 @@ class EventKind(StrEnum):
     BREAKER_FIRED = "breaker.fired"
     CHECKPOINT = "checkpoint"
     VERDICT = "verdict"
-    WARNING = "warning"
 
 
 class RunLog:
@@ -113,21 +112,29 @@ def read_events(path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     if not path.exists():
         return events
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+    with path.open(encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return events
 
 
 class NullRunLog(RunLog):
-    """No-op sink for tests and dry runs."""
+    """No-op sink for tests and dry runs.
+
+    Deliberately does NOT call `super().__init__`, which would open a real
+    file handle — but it must still populate every attribute the base class
+    declares, or an attribute only the null sink lacks would fail exclusively
+    in the dry-run path that exists to be safe.
+    """
 
     def __init__(self) -> None:
+        self.path = Path(os.devnull)
         self.run_id = "null"
         self._seq = 0
         self._lock = threading.Lock()

@@ -37,7 +37,7 @@ never fire at all, so they are enforced here rather than left to call sites.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum, auto
 
@@ -75,37 +75,26 @@ class BreakerVerdict:
         return BreakerTrip(code=self.code, detail=self.detail[:500])
 
 
-def failure_signature(
-    failing_test_ids: Sequence[str],
-    exception_type: str,
-    failing_location: str,
-    *,
-    lint_signature: str = "",
-    type_signature: str = "",
-) -> str:
-    """Normalized hash of (failing test IDs + exception type + file:line +
-    lint findings + type findings).
+#: How much of a failing command's output feeds the signature. Deliberately
+#: coarser than the old adapter-specific structured signature (PRD S12
+#: revised: a `DiscoveredToolchain`'s commands have no adapter-parsed rule
+#: codes/test IDs to hash) — same defect vs. different defect is now judged
+#: on "did the failing command's output tail change," not a precise finding
+#: identity. A real, accepted precision loss for CB-4's no-progress detector.
+_SIGNATURE_TAIL_CHARS = 500
 
-    Normalization is what makes the comparison meaningful: test IDs are sorted
-    and deduplicated so ordering noise from a parallel runner does not read as
-    progress, and the location keeps file:line but drops any column or absolute
-    prefix, which vary between runs without the defect changing.
 
-    `lint_signature`/`type_signature` (rule codes + locations, from the
-    adapter) exist because `failing_test_ids`/`exception_type`/
-    `failing_location` are test-failure-shaped and stay empty for a lint- or
-    type-only failure — without these two, EVERY lint-only or type-only
-    failure hashed to the same constant signature regardless of which rule or
-    error was actually present, so CB-4 could not tell "the same defect
-    persists" from "a different one replaced it."
+def failure_signature(failed_command: str, exit_code: int, output_tail: str) -> str:
+    """Normalized hash of (which command failed + its exit code + a tail of
+    its output).
+
+    Trimmed to the tail rather than the whole log so that noise earlier in
+    the output (e.g. an install step's progress bar) does not dominate the
+    comparison — the tail is where a test runner or linter's actual finding
+    lives.
     """
-    tests = ",".join(sorted(set(t.strip() for t in failing_test_ids if t.strip())))
-    location = failing_location.strip().rsplit(":", 1)
-    normalized_location = ":".join(location[:2]) if location else ""
-    payload = (
-        f"{tests}|{exception_type.strip()}|{normalized_location}"
-        f"|{lint_signature.strip()}|{type_signature.strip()}"
-    )
+    tail = output_tail.strip()[-_SIGNATURE_TAIL_CHARS:]
+    payload = f"{failed_command.strip()}|{exit_code}|{tail}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -338,7 +327,12 @@ def reset_for_new_task(state: AgentState) -> None:
 #: each needs information a poll does not have — CB-4 the kind of
 #: intervention that preceded the failure, CB-6 the diff that was just
 #: written and the need to fire before Talos runs at all (PRD S7.3, S7.4).
-POLLED_BREAKERS = (check_iteration_cap, check_budget_cap, check_wall_clock_cap, check_diff_thrash)
+POLLED_BREAKERS: tuple[Callable[[AgentState, Limits], BreakerVerdict | None], ...] = (
+    check_iteration_cap,
+    check_budget_cap,
+    check_wall_clock_cap,
+    check_diff_thrash,
+)
 
 
 class BreakerPanel:

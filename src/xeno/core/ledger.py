@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from xeno.core.state import BreakpointStats
-from xeno.core.types import Breakpoint, NodeRole, Tier
+from xeno.core.types import Breakpoint, Tier
 from xeno.core.usage import Usage
 
 
@@ -91,6 +91,9 @@ class CostLedger:
     calls: list[CallRecord] = field(default_factory=list)
     completed_tasks_usd: list[float] = field(default_factory=list)
     caching_enabled: bool = True
+    #: Running total at the previous task boundary, so `complete_task` can
+    #: attribute spend to one task without every caller tracking it.
+    _usd_at_last_task: float = 0.0
 
     def record(self, call: CallRecord) -> CallRecord:
         self.calls.append(call)
@@ -99,6 +102,20 @@ class CostLedger:
     def mark_task_completed(self, usd: float) -> None:
         """Record USD attributable to one completed plan task, for M1.3."""
         self.completed_tasks_usd.append(usd)
+
+    def complete_task(self) -> float:
+        """Close the current task's cost window and attribute it to M1.3.
+
+        Everything billed since the previous task boundary belongs to the task
+        that just passed — including its failed attempts and ladder climbs,
+        which is the point: M1.3 measures what a completed task actually
+        COSTS, not what its final successful attempt cost.
+        """
+        spent = self.usd_spent
+        attributable = spent - self._usd_at_last_task
+        self._usd_at_last_task = spent
+        self.mark_task_completed(attributable)
+        return attributable
 
     # ---- aggregates -----------------------------------------------------
 
@@ -217,6 +234,12 @@ class CostLedger:
     # ---- output ---------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
+        # Each of these walks every call in the run, and two are re-walked
+        # inside metrics() — bound to locals so one serialization costs one
+        # pass apiece rather than two or three.
+        usd_spent = self.usd_spent
+        uncached = self.usd_uncached_equivalent
+        cache_by_breakpoint = self.cache_stats_by_breakpoint()
         return {
             "run_id": self.run_id,
             "started_at": self.started_at,
@@ -225,9 +248,9 @@ class CostLedger:
             "totals": {
                 "calls": len(self.calls),
                 "failed_calls": sum(1 for c in self.calls if not c.ok),
-                "usd": round(self.usd_spent, 6),
+                "usd": round(usd_spent, 6),
                 "usd_is_lower_bound": self.has_unpriced_calls,
-                "usd_uncached_equivalent": round(self.usd_uncached_equivalent, 6),
+                "usd_uncached_equivalent": round(uncached, 6),
                 "tokens": sum(c.usage.total_tokens for c in self.calls),
             },
             "tokens_by_model": self.tokens_by_model,
@@ -235,7 +258,7 @@ class CostLedger:
             "usd_by_provider": {k: round(v, 6) for k, v in self.usd_by_provider.items()},
             "cache_by_breakpoint": {
                 bp: {**stats.model_dump(), "hit_rate": stats.hit_rate}
-                for bp, stats in self.cache_stats_by_breakpoint().items()
+                for bp, stats in cache_by_breakpoint.items()
             },
             "tier_escalations": self.escalations,
             "latency_ms": self.latency_summary(),
@@ -260,7 +283,3 @@ class CostLedger:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=False) + "\n")
         return path
-
-
-def node_key(role: NodeRole) -> str:
-    return role.value

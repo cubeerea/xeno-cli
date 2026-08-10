@@ -115,14 +115,19 @@ class CacheStats(BaseModel):
 
 
 class EvalReport(BaseModel):
-    """Talos's structured output. Always small; the log itself is a handle."""
+    """Talos's structured output (PRD S8.2 revised: gates run a discovered
+    command list, verdict is exit-code-based). Always small; the log itself
+    is a handle."""
 
-    parse_ok: bool = False
-    lint_errors: int = 0
-    type_errors: int = 0
-    tests_run: int = 0
-    tests_failed: int = 0
-    coverage_delta: float | None = None
+    #: Stored directly rather than derived from sub-counts — a discovered
+    #: toolchain's commands are not a fixed parse/lint/type/test split, so
+    #: there is nothing structured to derive `passed` from beyond the gate
+    #: chain's own exit-code verdict (`xeno.graph.gates.GateOutcome.passed`).
+    passed: bool = False
+    #: Name of the first required command that failed (`GateOutcome.
+    #: failed_command`), "" when `passed` is True or the failure was
+    #: infrastructure (nothing code-shaped to name).
+    failed_command: str = ""
     first_failure: str = Field(default="", max_length=500)
     full_log_handle: Handle | None = None
 
@@ -134,16 +139,6 @@ class EvalReport(BaseModel):
     #: Set when a patch touched a test file. Cerberus treats such a diff as
     #: presumptively invalid (PRD S10, Chiron hard rule).
     touched_test_files: list[str] = Field(default_factory=list)
-
-    @property
-    def passed(self) -> bool:
-        return (
-            self.parse_ok
-            and not self.infrastructure_failure
-            and self.lint_errors == 0
-            and self.type_errors == 0
-            and self.tests_failed == 0
-        )
 
 
 class CommitRef(BaseModel):
@@ -219,6 +214,13 @@ class AgentState(BaseModel):
 
     wall_clock_start: float = Field(default_factory=time.time)
     checkpoints: list[CommitRef] = Field(default_factory=list)
+
+    #: Every test file any task in this run wrote to, accumulated from each
+    #: `EvalReport.touched_test_files` as its task passes. Run-level rather
+    #: than per-task because Cerberus reviews the whole run's diff at the end,
+    #: by which point the last task's report is the only one still in state
+    #: (PRD S10: a diff that edits tests is presumptively invalid).
+    touched_test_files: list[str] = Field(default_factory=list)
 
     review_verdict: Verdict | None = None
     halt_reason: str | None = None

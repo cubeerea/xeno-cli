@@ -30,6 +30,7 @@ from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole, Verdict
+from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import Plan, PlanTask, read_plan, write_plan
 from xeno.graph.prompts import (
     CERBERUS_FORMAT_CORRECTION,
@@ -38,12 +39,9 @@ from xeno.graph.prompts import (
     parse_cerberus_output,
 )
 from xeno.prompt.assembly import PromptBuilder
+from xeno.prompt.delimit import as_data
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
-
-#: Same rationale as every other wire-format node's: one corrective nudge,
-#: not an open loop.
-_MAX_FORMAT_ATTEMPTS = 2
 
 
 def _write_handle(paths: RunPaths, call_index: int, label: str, text: str) -> Handle:
@@ -67,13 +65,11 @@ def _deterministic_escalate_report(state: AgentState) -> str:
         lines.append(f"Circuit breakers fired: {trips}")
     if state.eval_report is not None:
         report = state.eval_report
-        lines.append(
-            f"Last evaluation: parse_ok={report.parse_ok} lint_errors={report.lint_errors} "
-            f"type_errors={report.type_errors} "
-            f"tests_failed={report.tests_failed}/{report.tests_run}"
-        )
+        lines.append(f"Last evaluation: failed_command={report.failed_command!r}")
         if report.first_failure:
             lines.append(f"Last failure detail: {report.first_failure}")
+    if state.touched_test_files:
+        lines.append(f"Test files modified: {', '.join(state.touched_test_files)}")
     if state.checkpoints:
         last = state.checkpoints[-1]
         lines.append(
@@ -132,28 +128,24 @@ def make_cerberus_node(
         plan = read_plan(state.plan)
         current_turn = _build_current_turn(state, plan, diff_text)
 
-        output: CerberusOutput | None = None
-        for attempt in range(_MAX_FORMAT_ATTEMPTS):
-            turn_text = current_turn if attempt == 0 else CERBERUS_FORMAT_CORRECTION
-            prompt = builder.build(turn_text)
-            try:
-                result = router.complete(NodeRole.REVIEWER, prompt, state=state)
-            except ChainExhaustedError as exc:
-                # PRD S8.2 "Failure": the harness must never auto-approve in
-                # the absence of a review. `cerberus_notes` stays unset — its
-                # absence on an ESCALATE IS the UNREVIEWED signal.
-                state.halt_reason = f"cerberus: {exc}"
-                state.review_verdict = Verdict.ESCALATE
-                return state
+        try:
+            output = complete_with_format_retry(
+                router=router,
+                builder=builder,
+                node=NodeRole.REVIEWER,
+                state=state,
+                current_turn=current_turn,
+                correction=CERBERUS_FORMAT_CORRECTION,
+                parse=parse_cerberus_output,
+            )
+        except ChainExhaustedError as exc:
+            # PRD S8.2 "Failure": the harness must never auto-approve in the
+            # absence of a review. `cerberus_notes` stays unset — its absence
+            # on an ESCALATE IS the UNREVIEWED signal.
+            state.halt_reason = f"cerberus: {exc}"
+            state.review_verdict = Verdict.ESCALATE
+            return state
 
-            builder.append_turn("user", turn_text)
-            builder.append_turn("assistant", result.text)
-
-            output = parse_cerberus_output(result.text)
-            if not output.malformed:
-                break
-
-        assert output is not None
         return _apply_verdict(state, output, config, paths, call_index, plan)
 
     return node
@@ -165,9 +157,29 @@ def _build_current_turn(state: AgentState, plan: Plan, diff_text: str) -> str:
         "",
         "Plan:",
         *(f"- {t.description} (acceptance: {t.acceptance})" for t in plan.tasks),
+    ]
+    if state.touched_test_files:
+        # PRD S10: Chiron is refused outright when it touches a test file, but
+        # Daedalus writes tests legitimately as part of implementing a task.
+        # Telling them apart is a judgment call, which is Cerberus's job — so
+        # the fact is surfaced rather than enforced here.
+        lines += [
+            "",
+            "WARNING - this run modified test file(s): "
+            + ", ".join(state.touched_test_files),
+            "Judge whether these are legitimate new/updated tests for the goal, or "
+            "tests weakened to make the gates pass. The latter is grounds for "
+            "REJECT_AND_RETURN or ESCALATE regardless of how green the run is.",
+        ]
+    lines += [
         "",
         f"Full accumulated diff for this run ({len(state.checkpoints)} checkpoint(s)):",
-        diff_text if diff_text.strip() else "(no changes)",
+        # PRD S11.4: the diff is model-authored code derived from repository
+        # files — the one input to this node that an attacker could have
+        # shaped, and the node whose verdict is worth attacking.
+        as_data(diff_text, label="accumulated run diff")
+        if diff_text.strip()
+        else "(no changes)",
     ]
     return "\n".join(lines)
 

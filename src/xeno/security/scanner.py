@@ -45,7 +45,6 @@ KNOWN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
-    ("moonshot_api_key", re.compile(r"\bsk-[A-Za-z0-9]{48}\b")),
     ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
     ("digitalocean_token", re.compile(r"\bdop_v1_[a-f0-9]{64}\b")),
     ("sendgrid_api_key", re.compile(r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b")),
@@ -93,13 +92,7 @@ class Finding:
 
     label: str
     detector: str  # "known_prefix" | "assignment" | "high_entropy"
-    start: int
-    end: int
-    length: int
     preview: str  # first 4 chars + length only, safe to log
-
-    def __str__(self) -> str:
-        return f"{self.label} via {self.detector} at {self.start}:{self.end} ({self.preview})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,13 +104,6 @@ class ScanResult:
     def clean(self) -> bool:
         return not self.findings
 
-    @property
-    def summary(self) -> str:
-        if self.clean:
-            return "no secrets detected"
-        counts = Counter(f.label for f in self.findings)
-        return ", ".join(f"{label} x{n}" for label, n in sorted(counts.items()))
-
 
 def shannon_entropy(value: str) -> float:
     """Bits per character. ~4.0+ indicates a random-looking token; English
@@ -127,6 +113,13 @@ def shannon_entropy(value: str) -> float:
     counts = Counter(value)
     total = len(value)
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
+
+
+#: Bound on the per-scanner memo (see `SecretScanner.scan`). Sized to cover a
+#: prompt's static blocks plus a long accumulated history without growing with
+#: the run — the entries are prompt-sized strings, so this is a memory ceiling
+#: as much as a cache policy.
+_SCAN_CACHE_ENTRIES = 64
 
 
 class SecretScanner:
@@ -148,6 +141,7 @@ class SecretScanner:
         self.min_entropy_length = min_entropy_length
         self.redact_hex_digests = redact_hex_digests
         self.patterns = (*KNOWN_PATTERNS, *extra_patterns)
+        self._cache: dict[str, ScanResult] = {}
 
     def scan(self, text: str) -> ScanResult:
         """Return `text` with every detected secret replaced by a stable marker.
@@ -155,7 +149,30 @@ class SecretScanner:
         Markers are indexed rather than hashed. A hash of the secret would be a
         weak leak of the very thing being redacted, and it would also travel
         into the prompt cache.
+
+        Results are memoized because `xeno.security.outbound.sanitize` scans
+        EVERY layer of EVERY prompt, and most of those layers are byte-identical
+        call after call: the SYSTEM block is fingerprinted as constant per node
+        for the process lifetime (PRD T8), and each accumulated history turn is
+        immutable once appended, so an N-turn conversation otherwise re-scans
+        the same N-1 turns on every single call. Safe to cache because the scan
+        depends on nothing but `text` and this instance's configuration, none of
+        which is mutable after construction.
         """
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
+        result = self._scan_uncached(text)
+        if len(self._cache) >= _SCAN_CACHE_ENTRIES:
+            # Plain FIFO eviction on a dict (insertion-ordered since 3.7).
+            # A true LRU would buy little here: the hot entries are the system
+            # block and the history tail, and both are re-inserted as soon as
+            # they are evicted.
+            del self._cache[next(iter(self._cache))]
+        self._cache[text] = result
+        return result
+
+    def _scan_uncached(self, text: str) -> ScanResult:
         spans: list[tuple[int, int, str, str]] = []  # start, end, label, detector
 
         for label, pattern in self.patterns:
@@ -230,9 +247,6 @@ class SecretScanner:
                 Finding(
                     label=label,
                     detector=detector,
-                    start=start,
-                    end=end,
-                    length=len(secret),
                     preview=f"{secret[:4]}…({len(secret)} chars)",
                 )
             )

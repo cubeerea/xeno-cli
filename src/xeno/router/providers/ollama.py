@@ -25,6 +25,7 @@ from xeno.router.providers.base import (
     Provider,
     ProviderError,
     attribute_cache_to_breakpoints,
+    plain_messages,
 )
 
 
@@ -38,14 +39,8 @@ class OllamaProvider(Provider):
         # and are never sent to a local endpoint either (PRD S11.3).
         return {"content-type": "application/json"}
 
-    def build_messages(self, prompt: AssembledPrompt) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = []
-        static = [b.text for b in prompt.static_blocks if b.text]
-        if static:
-            messages.append({"role": "system", "content": "\n\n".join(static)})
-        messages.extend({"role": t.role, "content": t.content} for t in prompt.history)
-        messages.append({"role": "user", "content": prompt.current_turn})
-        return messages
+    def build_messages(self, prompt: AssembledPrompt) -> list[dict[str, Any]]:
+        return plain_messages(prompt)
 
     def complete(
         self,
@@ -65,7 +60,7 @@ class OllamaProvider(Provider):
             # keep low.
             "keep_alive": "30m",
         }
-        body = self._post(self.chat_path, payload)
+        body, latency_ms = self._post(self.chat_path, payload)
 
         message = body.get("message") or {}
         text = str(message.get("content") or "")
@@ -77,9 +72,8 @@ class OllamaProvider(Provider):
             text=text,
             model=str(body.get("model", model.model)),
             usage=usage,
-            latency_ms=float(body.get("_latency_ms", 0.0)),
+            latency_ms=latency_ms,
             by_breakpoint=attribute_cache_to_breakpoints(prompt, usage),
-            raw=body,
         )
 
     def health_check(self) -> tuple[bool, str]:
@@ -94,13 +88,6 @@ class OllamaProvider(Provider):
         except (ValueError, KeyError, TypeError):
             return True, "reachable (model list unparsable)"
         return True, f"{len(names)} model(s) pulled"
-
-    def installed_models(self) -> list[str]:
-        try:
-            response = self.client.get("/api/tags")
-            return [str(m["name"]) for m in response.json().get("models", [])]
-        except Exception:
-            return []
 
     def supports_prefix_cache(self) -> bool:
         """Whether this backend reuses a KV cache across calls.

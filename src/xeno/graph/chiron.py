@@ -10,7 +10,6 @@ patcher exists to avoid.
 
 from __future__ import annotations
 
-import difflib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,19 +18,20 @@ from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.nodeops import (
+    WorktreeEscape,
+    complete_with_format_retry,
+    write_file_blocks,
+)
 from xeno.graph.prompts import (
     CHIRON_FORMAT_CORRECTION,
     CHIRON_SYSTEM,
-    ChironOutput,
     parse_chiron_output,
 )
 from xeno.graph.testfiles import is_test_file
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
-
-#: Same rationale as Daedalus's: one corrective nudge, not an open loop.
-_MAX_FORMAT_ATTEMPTS = 2
 
 
 def _build_current_turn(state: AgentState) -> str:
@@ -41,8 +41,7 @@ def _build_current_turn(state: AgentState) -> str:
     lines = [
         f"Task: {state.goal}",
         "",
-        f"Evaluation failed: parse_ok={report.parse_ok} lint_errors={report.lint_errors} "
-        f"type_errors={report.type_errors} tests_failed={report.tests_failed}/{report.tests_run}",
+        f"Evaluation failed: failed_command={report.failed_command!r}",
     ]
     if report.first_failure:
         lines.append(f"Critical failure detail: {report.first_failure}")
@@ -51,22 +50,6 @@ def _build_current_turn(state: AgentState) -> str:
         "not rewrite files wholesale — patch only the file(s) that need to change."
     )
     return "\n".join(lines)
-
-
-def _compute_diff(worktree: Path, touched: list[Path], before: dict[Path, str]) -> str:
-    chunks: list[str] = []
-    for path in touched:
-        rel = path.relative_to(worktree).as_posix()
-        old = before.get(path, "")
-        new = path.read_text() if path.exists() else ""
-        diff = difflib.unified_diff(
-            old.splitlines(keepends=True),
-            new.splitlines(keepends=True),
-            fromfile=f"a/{rel}",
-            tofile=f"b/{rel}",
-        )
-        chunks.append("".join(diff))
-    return "\n".join(chunks)
 
 
 def make_chiron_node(
@@ -102,8 +85,7 @@ def make_chiron_node(
         # CB-1's per-task cap (PRD S7.3) is a backstop above RUNG_BUDGETS,
         # not a Daedalus-specific counter — every attempt at the task,
         # including each L1 patch, must count against it, or a task stuck
-        # oscillating through Chiron alone (Daedalus called exactly once in
-        # Phase 2's graph) could never trip it.
+        # oscillating through Chiron alone could never trip it.
         state.iterations_this_task += 1
 
         # PRD S9.6.5: refreshed immediately before build(), never stale.
@@ -112,24 +94,20 @@ def make_chiron_node(
 
         current_turn = _build_current_turn(state)
 
-        output: ChironOutput | None = None
-        for attempt in range(_MAX_FORMAT_ATTEMPTS):
-            turn_text = current_turn if attempt == 0 else CHIRON_FORMAT_CORRECTION
-            prompt = builder.build(turn_text)
-            try:
-                result = router.complete(NodeRole.DEBUGGER, prompt, state=state)
-            except ChainExhaustedError as exc:
-                state.halt_reason = f"chiron: {exc}"
-                return state
+        try:
+            output = complete_with_format_retry(
+                router=router,
+                builder=builder,
+                node=NodeRole.DEBUGGER,
+                state=state,
+                current_turn=current_turn,
+                correction=CHIRON_FORMAT_CORRECTION,
+                parse=parse_chiron_output,
+            )
+        except ChainExhaustedError as exc:
+            state.halt_reason = f"chiron: {exc}"
+            return state
 
-            builder.append_turn("user", turn_text)
-            builder.append_turn("assistant", result.text)
-
-            output = parse_chiron_output(result.text)
-            if not output.malformed:
-                break
-
-        assert output is not None
         if output.declined:
             report_declined(True, output.decline_reason)
             return state
@@ -137,31 +115,18 @@ def make_chiron_node(
         test_hits = [b.path for b in output.files if is_test_file(Path(b.path).as_posix())]
         if test_hits:
             # PRD S10 hard rule: a patch touching a test file is rejected
-            # outright, not partially applied. No Cerberus yet to flag it to
-            # (PRD S13 Phase 2) — refusing the write is the Phase 2 stand-in
-            # for that review.
+            # outright, not partially applied — refusing the write is the
+            # enforcement, not a note for the reviewer to weigh later.
             report_declined(
                 True, f"patch touched test file(s), refused: {', '.join(test_hits)}"
             )
             return state
 
-        before: dict[Path, str] = {}
-        written: list[Path] = []
-        for block in output.files:
-            # See daedalus.py for why the containment check is resolved but
-            # the path used for every read/write/storage is not.
-            target = worktree / block.path
-            try:
-                target.resolve().relative_to(worktree.resolve())
-            except ValueError:
-                state.halt_reason = (
-                    f"chiron attempted to write outside the worktree: {block.path}"
-                )
-                return state
-            before[target] = target.read_text() if target.exists() else ""
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(block.content)
-            written.append(target)
+        try:
+            written, diff_text = write_file_blocks(worktree, output.files)
+        except WorktreeEscape as exc:
+            state.halt_reason = f"chiron attempted to write outside the worktree: {exc.path}"
+            return state
 
         keyring.mark_worktree_written(written, reason=f"chiron call {call_index}")
         # Accumulate, not replace: Talos's lint/type scope must cover every
@@ -172,7 +137,6 @@ def make_chiron_node(
             if path not in touched_files:
                 touched_files.append(path)
 
-        diff_text = _compute_diff(worktree, written, before)
         diff_path = paths.workspace / f"chiron_diff_{call_index}.patch"
         diff_path.write_text(diff_text)
         state.diff_handle = Handle.for_file(

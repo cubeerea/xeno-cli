@@ -73,14 +73,6 @@ ASSEMBLY_ORDER: tuple[Breakpoint, ...] = (
     Breakpoint.CURRENT_TURN,
 )
 
-#: Layers eligible for caching. CURRENT_TURN is excluded by definition — it is
-#: different on every call, so a breakpoint on it would only cost write price.
-CACHEABLE_BREAKPOINTS: tuple[Breakpoint, ...] = (
-    Breakpoint.SYSTEM,
-    Breakpoint.CODEBASE_MAP,
-    Breakpoint.ACCUMULATED_HISTORY,
-)
-
 
 class ProviderFamily(StrEnum):
     """How a provider handles prompt caching (PRD S9.6.3).
@@ -108,8 +100,6 @@ class Verdict(StrEnum):
     ESCALATE = "escalate"
 
 
-TERMINAL_VERDICTS: frozenset[Verdict] = frozenset({Verdict.APPROVE, Verdict.ESCALATE})
-
 
 class LadderRung(StrEnum):
     """The bounded escalation ladder (PRD S7.2). Values match ladder_rung ints."""
@@ -125,11 +115,9 @@ class LadderRung(StrEnum):
 #: Per-rung attempt budgets (PRD S7.2). L5 is terminal and has no budget.
 RUNG_BUDGETS: dict[int, int] = {0: 1, 1: 3, 2: 2, 3: 2, 4: 1}
 
-MAX_RUNG = 5
-
 
 class BreakerCode(StrEnum):
-    """Circuit breakers (PRD S7.3). CB-2/5/6 land in Phase 2."""
+    """Circuit breakers (PRD S7.3). All six ship; see `xeno.core.breakers`."""
 
     CB1_ITERATION_CAP = "CB-1"
     CB2_WALL_CLOCK_CAP = "CB-2"
@@ -137,9 +125,3 @@ class BreakerCode(StrEnum):
     CB4_NO_PROGRESS = "CB-4"
     CB5_DIFF_THRASH = "CB-5"
     CB6_DESTRUCTIVE_ACTION = "CB-6"
-
-
-#: Breakers implemented in Phase 0 (PRD S7.4).
-PHASE_0_BREAKERS: frozenset[BreakerCode] = frozenset(
-    {BreakerCode.CB1_ITERATION_CAP, BreakerCode.CB3_BUDGET_CAP, BreakerCode.CB4_NO_PROGRESS}
-)

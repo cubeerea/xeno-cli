@@ -6,12 +6,17 @@ or empty file selection is handled gracefully here rather than halting the
 run — Daedalus and Chiron already work fine with zero context handles (that
 was Phase 1 and 2's whole starting point), just less efficiently.
 
-Deliberately scoped without tree-sitter (`LanguageAdapter.grammar()` stays
-unimplemented): the exit criterion is autonomous multi-file completion, not
-a symbol table, and file-tree-plus-task-description is enough signal for a
-light-tier model to pick relevant files without paying to read their
-content — which would make Argus as expensive as the node it exists to keep
-cheap.
+Deliberately scoped without tree-sitter: the exit criterion is autonomous
+multi-file completion, not a symbol table, and file-tree-plus-task-description
+is enough signal for a light-tier model to pick relevant files without paying
+to read their content — which would make Argus as expensive as the node it
+exists to keep cheap.
+
+Argus's JOB 3 (`xeno.adapters.discovery`) is the one exception to "narrows
+context, never gates correctness": toolchain discovery genuinely does decide
+which commands Talos's gates run — but never the pass/fail verdict itself
+(PRD S8.2), and it is a one-time, cached, validated call, not part of this
+module's per-task loop.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import current_task, read_plan
 from xeno.graph.prompts import (
     ARGUS_FORMAT_CORRECTION,
@@ -36,9 +42,6 @@ from xeno.graph.prompts import (
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
-
-#: Same rationale as Daedalus's: one corrective nudge, not an open loop.
-_MAX_FORMAT_ATTEMPTS = 2
 
 #: PRD S7.2: the rung that means "re-research because a patch already
 #: failed" rather than "first look at this task."
@@ -132,24 +135,20 @@ def make_argus_nodes(
                 lines.append(f"Prior failure detail: {report.first_failure}")
         current_turn = "\n".join(lines)
 
-        output = None
-        for attempt in range(_MAX_FORMAT_ATTEMPTS):
-            turn_text = current_turn if attempt == 0 else ARGUS_FORMAT_CORRECTION
-            prompt = builder.build(turn_text)
-            try:
-                result = router.complete(NodeRole.RESEARCHER, prompt, state=state)
-            except ChainExhaustedError as exc:
-                state.halt_reason = f"argus (research): {exc}"
-                return state
+        try:
+            output = complete_with_format_retry(
+                router=router,
+                builder=builder,
+                node=NodeRole.RESEARCHER,
+                state=state,
+                current_turn=current_turn,
+                correction=ARGUS_FORMAT_CORRECTION,
+                parse=parse_argus_research_output,
+            )
+        except ChainExhaustedError as exc:
+            state.halt_reason = f"argus (research): {exc}"
+            return state
 
-            builder.append_turn("user", turn_text)
-            builder.append_turn("assistant", result.text)
-
-            output = parse_argus_research_output(result.text)
-            if not output.malformed:
-                break
-
-        assert output is not None
         if output.files:
             existing = {_rel_key(h.path, worktree): h for h in state.context_handles}
             for ref in output.files:

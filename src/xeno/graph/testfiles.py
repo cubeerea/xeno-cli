@@ -5,11 +5,23 @@ write landed in what looks like a test file, and Chiron's hard rule ("MUST
 NOT modify test files to make tests pass") is enforced against the same
 definition — one drifting out of sync with the other would let a patch slip
 past the rule it's supposed to be checked against.
+
+Markers span multiple languages' conventions (PRD S12 revised: gates are no
+longer Python-only) rather than one ecosystem's — Python's `test_*.py`
+alongside JS/TS's `*.test.*`/`*.spec.*`/`__tests__/`.
 """
 
 from __future__ import annotations
 
-TEST_FILE_MARKERS = ("test_", "_test.py", "/tests/", "conftest.py")
+TEST_FILE_MARKERS = (
+    "test_",
+    "_test.py",
+    "/tests/",
+    "conftest.py",
+    ".test.",
+    ".spec.",
+    "__tests__/",
+)
 
 
 def is_test_file(rel_path: str) -> bool:

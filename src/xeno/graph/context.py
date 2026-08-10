@@ -1,10 +1,10 @@
 """Building the CODEBASE MAP breakpoint (PRD S9.6.1), used by Daedalus and
 Chiron alike.
 
-There is no Argus until Phase 3 (PRD S13). The PRD's OQ-10 names a manual
-`@file` context mechanism as a scaffold standing in for it until Argus
-exists; this module is that scaffold's harness-side half — a plain
-file-tree-plus-contents dump, not a summarized index.
+Argus (`xeno.graph.argus`) is what normally selects the focus files; the
+PRD's OQ-10 `@file` mechanism, surfaced as `xeno run --file`, lets a user add
+to that selection by hand. Either way this module renders the result the same
+way — a plain file-tree-plus-contents dump, not a summarized index.
 """
 
 from __future__ import annotations
@@ -12,14 +12,23 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from xeno.prompt.delimit import as_data
 from xeno.prompt.keys import DEFAULT_IGNORES
+
+#: Fixed cost of `as_data`'s header, warning line, and footer, excluding the
+#: `source=` path. Measured once rather than guessed, so the content budget
+#: stays honest as the wrapper's wording changes.
+_DATA_BLOCK_OVERHEAD = len(as_data("", label="repository file", source="", truncate_to=0)) + len(
+    " truncated=true"
+)
 
 #: Directories whose content is skipped by default (still listed in the file
 #: tree). PRD OQ-10's manual `@file` scaffold exists precisely so a local
 #: model is not handed the whole repository, including its own test suite,
 #: as system-prompt filler on every call — a large local model already
 #: struggles to hold instructions under a big context; a full-tree content
-#: dump made that worse in practice (see xeno.graph.daedalus's format-retry).
+#: dump made that worse in practice (hence the corrective retry every node
+#: shares via `xeno.graph.nodeops.complete_with_format_retry`).
 _CONTENT_EXCLUDED_DIRS = frozenset({"tests", "tests_pending", "test"})
 
 
@@ -41,8 +50,9 @@ def build_codebase_map(
 ) -> str:
     """A file tree plus file content, budget-capped.
 
-    `focus` is the manual `@file` context (PRD OQ-10, this project's Argus
-    stand-in until Phase 3): when given, ONLY those files' content is shown —
+    `focus` is whatever narrowed the context — Argus's own file selection or
+    the user's `--file` (PRD OQ-10). When given, ONLY those files' content is
+    shown —
     the tree still lists everything else for orientation, but a user who
     named the relevant file(s) has already done Argus's job, and dumping the
     rest of the tree's content on top only spends context for no benefit.
@@ -74,9 +84,17 @@ def build_codebase_map(
             text = f.read_text()
         except OSError:
             continue
-        block = f"\n--- {f.relative_to(worktree).as_posix()} ---\n{text}"
-        if len(block) > budget:
-            block = block[:budget] + "\n...(truncated)"
+        rel = f.relative_to(worktree).as_posix()
+        # PRD S11.4: repository files are untrusted input. Every retrieved
+        # file goes into the prompt inside a labelled, guarded DATA block, so
+        # a file containing text aimed at whichever node reads it has been
+        # explicitly framed as content rather than instruction. The guard is
+        # derived from the content (not random), so an unchanged file still
+        # produces byte-identical CODEBASE MAP text and keeps its cache hit.
+        room = budget - _DATA_BLOCK_OVERHEAD - len(rel)
+        if room <= 0:
+            continue
+        block = "\n" + as_data(text, label="repository file", source=rel, truncate_to=room)
         lines.append(block)
         budget -= len(block)
     return "\n".join(lines)

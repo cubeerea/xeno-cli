@@ -1,9 +1,10 @@
 """The evaluator node (PRD S10): deterministic gates, plus log triage only.
 
-"THE GATES ARE DETERMINISTIC TOOLS, not model calls" (PRD S8.2) — parse,
-lint, type, and test verdicts are decided entirely by `xeno.graph.gates`
-before any model is involved. The one model call this node makes is used
-only to compress a failure log to its <=500-char critical span; it never
+"THE GATES ARE DETERMINISTIC TOOLS, not model calls" (PRD S8.2) — the
+pass/fail verdict is decided entirely by `xeno.graph.gates` running a
+`DiscoveredToolchain`'s commands and reading their exit codes, before any
+model is involved. The one model call this node makes is used only to
+compress a failure log to its <=500-char critical span; it never
 participates in the pass/fail decision, and its failure is never fatal to
 the run (falls back to a deterministic truncation).
 
@@ -20,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from xeno.adapters.base import LanguageAdapter
+from xeno.adapters.generic import GenericAdapter
 from xeno.core.breakers import BreakerPanel, Intervention, failure_signature, observe_failure
 from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
@@ -32,6 +33,7 @@ from xeno.graph.gates import run_gates
 from xeno.graph.prompts import TALOS_TRIAGE_SYSTEM
 from xeno.graph.testfiles import is_test_file
 from xeno.prompt.assembly import PromptBuilder
+from xeno.prompt.delimit import as_data
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
 from xeno.sandbox.pool import WarmPool
@@ -51,7 +53,7 @@ def make_talos_node(
     worktree: Path,
     touched_files: list[Path],
     pool: WarmPool,
-    adapter: LanguageAdapter,
+    adapter: GenericAdapter,
     breaker_panel: BreakerPanel,
     runlog: RunLog,
     intervention: Callable[[], Intervention],
@@ -79,20 +81,15 @@ def make_talos_node(
         caching_enabled=config.caching.enabled,
     )
     call_index = 0
-    #: Coverage DELTA (PRD S10 gate 5) is measured against the previous
-    #: evaluation within this same run — there is no checkpoint-based
-    #: baseline until Phase 3, so "previous Talos call" is the best available
-    #: reference point. None until two green evaluations have happened.
-    last_coverage: float | None = None
 
     def node(state: AgentState) -> AgentState:
-        nonlocal call_index, last_coverage
+        nonlocal call_index
         call_index += 1
 
         sandbox = pool.acquire()
         try:
             sandbox.sync_worktree(worktree, secrets=config.secrets)
-            outcome = run_gates(sandbox, adapter, worktree, touched_files)
+            outcome = run_gates(sandbox, adapter.toolchain)
         finally:
             pool.release(sandbox)
 
@@ -102,30 +99,14 @@ def make_talos_node(
             log_path, summary=f"talos evaluation {call_index}: {len(outcome.log)} bytes"
         )
 
-        passed = (
-            outcome.parse_ok
-            and not outcome.infrastructure_failure
-            and outcome.lint_errors == 0
-            and outcome.type_errors == 0
-            and outcome.tests_failed == 0
+        first_failure = (
+            "" if outcome.passed else _triage(outcome.log, state, builder, worktree, router)
         )
-
-        first_failure = "" if passed else _triage(outcome.log, state, builder, worktree, router)
-
-        coverage_delta = None
-        if outcome.coverage_percent is not None:
-            if last_coverage is not None:
-                coverage_delta = outcome.coverage_percent - last_coverage
-            last_coverage = outcome.coverage_percent
 
         touched_rel = [str(p.relative_to(worktree)) for p in touched_files]
         report = EvalReport(
-            parse_ok=outcome.parse_ok,
-            lint_errors=outcome.lint_errors,
-            type_errors=outcome.type_errors,
-            tests_run=outcome.tests_run,
-            tests_failed=outcome.tests_failed,
-            coverage_delta=coverage_delta,
+            passed=outcome.passed,
+            failed_command=outcome.failed_command,
             first_failure=first_failure[:500],
             full_log_handle=log_handle,
             infrastructure_failure=outcome.infrastructure_failure,
@@ -133,13 +114,9 @@ def make_talos_node(
         )
         state.eval_report = report
 
-        if not passed:
+        if not outcome.passed:
             signature = failure_signature(
-                outcome.failing_test_ids,
-                outcome.exception_type,
-                outcome.failing_location,
-                lint_signature=outcome.lint_signature,
-                type_signature=outcome.type_signature,
+                outcome.failed_command, outcome.exit_code or 0, outcome.log
             )
             verdict = observe_failure(state, signature, intervention=intervention())
             if verdict is not None:
@@ -160,12 +137,16 @@ def _triage(
 ) -> str:
     """Best-effort log compression. Never blocks the run on failure."""
     window = log[-_TRIAGE_LOG_WINDOW:]
+    # PRD S11.4: gate output quotes the repository back at us — assertion
+    # messages, source excerpts, filenames — so it is untrusted for the same
+    # reason the files themselves are.
+    turn_text = as_data(window, label="gate output")
     try:
         focus = [h.path for h in state.context_handles] or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
-        prompt = builder.build(window)
+        prompt = builder.build(turn_text)
         result = router.complete(NodeRole.EVALUATOR, prompt, state=state)
-        builder.append_turn("user", window)
+        builder.append_turn("user", turn_text)
         builder.append_turn("assistant", result.text)
         return result.text.strip()
     except ChainExhaustedError:

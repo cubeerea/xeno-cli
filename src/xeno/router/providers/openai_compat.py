@@ -20,6 +20,7 @@ from xeno.router.providers.base import (
     Provider,
     ProviderError,
     attribute_cache_to_breakpoints,
+    plain_messages,
 )
 
 
@@ -49,9 +50,7 @@ class OpenAICompatProvider(Provider):
                     content.append(part)
                 messages.append({"role": "system", "content": content})
             else:
-                messages.append(
-                    {"role": "system", "content": "\n\n".join(b.text for b in static)}
-                )
+                return plain_messages(prompt)
 
         messages.extend({"role": t.role, "content": t.content} for t in prompt.history)
         messages.append({"role": "user", "content": prompt.current_turn})
@@ -81,7 +80,7 @@ class OpenAICompatProvider(Provider):
         max_tokens: int,
         temperature: float = 0.0,
     ) -> CompletionResult:
-        body = self._post(
+        body, latency_ms = self._post(
             self.chat_path,
             self.build_payload(prompt, model, max_tokens=max_tokens, temperature=temperature),
         )
@@ -91,9 +90,8 @@ class OpenAICompatProvider(Provider):
             text=text,
             model=body.get("model", model.model),
             usage=usage,
-            latency_ms=float(body.get("_latency_ms", 0.0)),
+            latency_ms=latency_ms,
             by_breakpoint=attribute_cache_to_breakpoints(prompt, usage),
-            raw=body,
         )
 
     def health_check(self) -> tuple[bool, str]:
@@ -107,14 +105,6 @@ class OpenAICompatProvider(Provider):
         if response.status_code >= 400:
             return False, f"HTTP {response.status_code}: {response.text[:160]}"
         return True, "reachable"
-
-    def min_cacheable_tokens(self) -> int:
-        """OpenAI-compatible endpoints discount only prefixes at or above this
-        length (PRD S9.6.3, ref [17]). Talos's and Argus's system prompts are
-        naturally short and may never clear it — acceptable, since both are
-        LIGHT-tier and cheap regardless."""
-        return 1024
-
 
 class OpenRouterProvider(OpenAICompatProvider):
     """OpenRouter. Same protocol, different caching story.

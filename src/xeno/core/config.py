@@ -118,15 +118,6 @@ class CacheConfig(BaseModel):
 
     enabled: bool = True
 
-    #: SYSTEM and CODEBASE MAP request the 1-hour TTL because a run may last
-    #: max_runtime_minutes (default 45) and a 5-minute cache would cold-start
-    #: across any long Talos test run (PRD S9.6.3).
-    long_ttl_breakpoints: tuple[str, ...] = ("system", "codebase_map")
-
-    #: OpenAI-compatible providers discount only prefixes at or above this
-    #: length (PRD S9.6.3, ref [17]). Shorter system prompts get nothing.
-    openai_min_cacheable_tokens: int = 1024
-
     #: Send a duplicate prefix at startup and compare cost/latency, so we do
     #: not assume aggregator parity with Anthropic or OpenAI (PRD S9.6.3,
     #: OQ-11). Providers that fail the probe get cache-dependent cost
@@ -186,7 +177,6 @@ class GitConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     branch_prefix: str = "xeno/"
-    squash_per_run: bool = True  # OQ-4: release v1 assumes per-run
     open_pr: bool = False
 
 
@@ -385,7 +375,3 @@ def default_config() -> XenoConfig:
             for role, tier in DEFAULT_NODE_TIERS.items()
         },
     )
-
-
-def state_dir(repo_root: Path) -> Path:
-    return repo_root / STATE_DIRNAME

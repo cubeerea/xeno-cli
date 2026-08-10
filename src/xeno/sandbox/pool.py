@@ -37,7 +37,7 @@ import docker
 from docker.errors import DockerException, ImageNotFound
 from docker.models.containers import Container
 
-from xeno.adapters.base import LanguageAdapter
+from xeno.adapters.generic import GenericAdapter
 from xeno.core.config import SandboxConfig, SecretsConfig
 from xeno.sandbox.profile import WORKSPACE_MOUNT, container_kwargs, install_container_kwargs
 from xeno.security.mounts import mount_ignore
@@ -90,8 +90,16 @@ class Sandbox:
         own; the container is never reused after this Sandbox is released
         (see module docstring), so the orphaned exec has nothing left to
         affect.
+
+        The executor is shut down with `wait=False`, and NOT via a `with`
+        block: `ThreadPoolExecutor.__exit__` calls `shutdown(wait=True)`,
+        which blocks until the very command that just timed out finishes —
+        so a `with` here would make the timeout report a timeout while still
+        taking the hung command's full wall-clock time, defeating the point
+        of having one at all.
         """
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
             future = pool.submit(
                 self.container.exec_run, list(argv), workdir=WORKSPACE_MOUNT, demux=False
             )
@@ -99,6 +107,8 @@ class Sandbox:
                 result = future.result(timeout=timeout)
             except FutureTimeoutError:
                 return -1, f"INFRASTRUCTURE: {argv[0]} timed out after {timeout}s in sandbox"
+        finally:
+            pool.shutdown(wait=False)
         raw = result.output
         assert isinstance(raw, bytes | type(None)), "demux=False, stream unset: bytes or None"
         output = (raw or b"").decode(errors="replace")
@@ -111,7 +121,7 @@ class WarmPool:
     def __init__(
         self,
         client: docker.DockerClient,
-        adapter: LanguageAdapter,
+        adapter: GenericAdapter,
         config: SandboxConfig,
         *,
         workspace_root: Path,
@@ -131,12 +141,6 @@ class WarmPool:
         self._counter = 0
         self._counter_lock = threading.Lock()
         self._closed = False
-
-    def ensure_image(self) -> None:
-        """Build the adapter's base image if it is not already cached
-        locally (PRD S11.1: 'Base image built per LanguageAdapter, cached
-        locally'). A no-op on every run after the first."""
-        _ensure_image(self._client, self._adapter.image(), self._adapter.dockerfile())
 
     def fill(self) -> None:
         """Pool fill (PRD M3.3): pay the cold-start cost once, up front, so
@@ -182,10 +186,14 @@ class WarmPool:
             return
         try:
             self._ready.put(self._create_one())
-        except DockerException:
+        except Exception:
             # A failed replenishment shrinks the pool rather than crashing a
             # background thread silently; the next acquire()'s cold-start
-            # fallback covers the shortfall.
+            # fallback covers the shortfall. Deliberately broader than
+            # DockerException: this runs in a background thread whose Future
+            # is discarded, so anything NOT caught here (an OSError from the
+            # scratch-dir mkdir, say) disappears without a trace and the pool
+            # silently shrinks with no log line at all.
             logger.exception("sandbox pool replenishment failed")
 
     def _new_scratch_dir(self) -> Path:
@@ -229,7 +237,7 @@ def _destroy(sandbox: Sandbox) -> None:
 
 def prepare_gate_image(
     client: docker.DockerClient,
-    adapter: LanguageAdapter,
+    adapter: GenericAdapter,
     config: SandboxConfig,
     *,
     worktree: Path,
@@ -268,7 +276,7 @@ def prepare_gate_image(
 
 def _run_install(
     client: docker.DockerClient,
-    adapter: LanguageAdapter,
+    adapter: GenericAdapter,
     config: SandboxConfig,
     worktree: Path,
     workspace_root: Path,
@@ -294,10 +302,15 @@ def _run_install(
         code, output = sandbox.exec(install_cmd, timeout=_BUILD_TIMEOUT_SECONDS)
         if code != 0:
             raise DockerException(f"dependency install failed (exit {code}): {output[-2000:]}")
-        container.commit(repository=tag.split(":")[0], tag=tag.split(":")[1])
+        repository, _, version = tag.rpartition(":")
+        container.commit(repository=repository, tag=version)
         return tag
     finally:
-        container.remove(force=True)
+        # Suppressed for the same reason `_destroy` suppresses: a container
+        # that will not remove must not prevent the scratch tree — which may
+        # hold a copy of the user's source — from being cleaned up.
+        with contextlib.suppress(DockerException):
+            container.remove(force=True)
         shutil.rmtree(scratch, ignore_errors=True)
 
 

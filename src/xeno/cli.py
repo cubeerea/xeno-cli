@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import docker
 import typer
@@ -26,7 +29,8 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from xeno import __version__
-from xeno.adapters.python import PythonAdapter
+from xeno.adapters.discovery import DiscoveryError, discover_toolchain
+from xeno.adapters.generic import GenericAdapter
 from xeno.core import vcs
 from xeno.core.config import (
     CONFIG_FILENAME,
@@ -35,7 +39,7 @@ from xeno.core.config import (
     load_config,
 )
 from xeno.core.ledger import CostLedger
-from xeno.core.paths import RunPaths, new_run_id, short_run_id, slugify
+from xeno.core.paths import RunPaths, new_run_id, run_branch_name
 from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import CALLSIGNS, NodeRole, Tier, Verdict
@@ -61,6 +65,19 @@ app.add_typer(config_app)
 
 console = Console()
 
+#: Declared once and shared: five commands take the same `--config` flag, and
+#: Typer resolves an `Annotated` alias identically to an inline annotation.
+ConfigOption = Annotated[Path | None, typer.Option("--config", "-c")]
+
+
+def _warn(message: str) -> None:
+    console.print(f"[yellow]warning:[/] {message}")
+
+
+def _error(message: str) -> None:
+    console.print(f"[red]error:[/] {message}")
+
+
 #: Exercised on every `models test` call so the caching path is measured
 #: through the real assembly code rather than a bespoke test prompt. Long
 #: enough to clear OpenAI's 1,024-token minimum cacheable prefix (PRD S9.6.3).
@@ -84,7 +101,7 @@ def _resolve_config(path: Path | None) -> XenoConfig:
         raise typer.Exit(code=2) from exc
 
 
-def _capability_warnings(config: XenoConfig) -> list[str]:
+def _print_capability_warnings(config: XenoConfig) -> None:
     """PRD S9.4. The flagship warning is unconditional whenever the tier
     resolves to any locally-served model, at any size — there is no parameter
     threshold that makes a local model flagship-class on this project's target
@@ -104,7 +121,80 @@ def _capability_warnings(config: XenoConfig) -> list[str]:
         )
     if not config.caching.enabled:
         warnings.append("prompt caching is disabled; M1.4 will not be measurable this run.")
-    return warnings
+    for warning in warnings:
+        _warn(warning)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunContext:
+    """Everything both `models test` and `run` stand up before doing any
+    work. Bundled so the two commands cannot drift on the order they build
+    it in — the ledger has to exist before the router that feeds it, and the
+    run log before the router that writes to it."""
+
+    run_id: str
+    paths: RunPaths
+    ledger: CostLedger
+    router: Router
+    state: AgentState
+    keyring: CacheKeyring
+
+
+def _start_run(
+    config: XenoConfig,
+    stack: ExitStack,
+    *,
+    repo_root: Path,
+    state_goal: str,
+    succeeded: Callable[[], bool],
+    keyring_on_worktree: bool = False,
+    **event_fields: Any,
+) -> tuple[_RunContext, RunLog]:
+    """Open a run's log, ledger, router, and state, registering teardown on
+    `stack` as each is acquired.
+
+    The `ExitStack` is the caller's, not this function's: an error anywhere
+    downstream — image build, pool fill, the graph itself — must still close
+    the router and the log, and only the caller knows where that scope ends.
+    Registration order is LIFO and load-bearing: RUN_END is registered
+    immediately after the log so it unwinds LAST, after every resource the
+    caller adds later has already been released — a run's final event should
+    describe a run that is actually over.
+
+    `succeeded` is a callable rather than a value because the outcome is only
+    known at teardown time, long after this function has returned.
+    """
+    run_id = new_run_id()
+    paths = RunPaths(repo_root=repo_root, run_id=run_id).ensure()
+    ledger = CostLedger(run_id=run_id, caching_enabled=config.caching.enabled)
+    scanner = SecretScanner(entropy_threshold=config.secrets.entropy_threshold)
+
+    runlog = stack.enter_context(RunLog(paths.events, run_id=run_id))
+    runlog.event(
+        EventKind.RUN_START,
+        xeno_version=__version__,
+        config_source=str(config.source_path or "defaults"),
+        **event_fields,
+    )
+    stack.callback(lambda: runlog.event(EventKind.RUN_END, ok=succeeded()))
+
+    router = Router(config, ledger=ledger, runlog=runlog, scanner=scanner)
+    stack.callback(router.close)
+
+    return (
+        _RunContext(
+            run_id=run_id,
+            paths=paths,
+            ledger=ledger,
+            router=router,
+            state=AgentState(run_id=run_id, goal=state_goal),
+            keyring=CacheKeyring(
+                run_id=run_id,
+                worktree_root=paths.worktree if keyring_on_worktree else paths.workspace,
+            ),
+        ),
+        runlog,
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -138,7 +228,7 @@ def init(
 
 @config_app.command("show")
 def config_show(
-    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    config_path: ConfigOption = None,
 ) -> None:
     """Render the resolved configuration and any capability warnings."""
     config = _resolve_config(config_path)
@@ -171,13 +261,12 @@ def config_show(
         limits.add_row(name, str(value))
     console.print(limits)
 
-    for warning in _capability_warnings(config):
-        console.print(f"[yellow]warning:[/] {warning}")
+    _print_capability_warnings(config)
 
 
 @app.command()
 def doctor(
-    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    config_path: ConfigOption = None,
 ) -> None:
     """Check that every configured provider is reachable and usable."""
     config = _resolve_config(config_path)
@@ -209,12 +298,11 @@ def doctor(
             )
         console.print(table)
         for warning in router.warn_local_backends_without_prefix_cache():
-            console.print(f"[yellow]warning:[/] {warning}")
+            _warn(warning)
     finally:
         router.close()
 
-    for warning in _capability_warnings(config):
-        console.print(f"[yellow]warning:[/] {warning}")
+    _print_capability_warnings(config)
 
     if not ok:
         raise typer.Exit(code=1)
@@ -222,7 +310,7 @@ def doctor(
 
 @models_app.command("list")
 def models_list(
-    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    config_path: ConfigOption = None,
 ) -> None:
     """Show which model each node resolves to."""
     config = _resolve_config(config_path)
@@ -241,7 +329,7 @@ def models_list(
 
 @models_app.command("test")
 def models_test(
-    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    config_path: ConfigOption = None,
     repo: Annotated[Path, typer.Option("--repo", help="Repository root for .xeno/.")] = Path("."),
     skip_probe: Annotated[bool, typer.Option("--skip-probe")] = False,
 ) -> None:
@@ -253,92 +341,72 @@ def models_test(
     what the exit criterion asks for.
     """
     config = _resolve_config(config_path)
-    for warning in _capability_warnings(config):
-        console.print(f"[yellow]warning:[/] {warning}")
-
-    run_id = new_run_id()
-    paths = RunPaths(repo_root=repo.resolve(), run_id=run_id).ensure()
-    ledger = CostLedger(run_id=run_id, caching_enabled=config.caching.enabled)
-    scanner = SecretScanner(entropy_threshold=config.secrets.entropy_threshold)
+    _print_capability_warnings(config)
     failures: list[str] = []
 
-    with RunLog(paths.events, run_id=run_id) as runlog:
-        runlog.event(
-            EventKind.RUN_START,
+    with ExitStack() as stack:
+        ctx, _ = _start_run(
+            config,
+            stack,
+            repo_root=repo.resolve(),
+            state_goal="models test",
+            succeeded=lambda: not ctx.ledger.has_unpriced_calls,
             command="models test",
-            xeno_version=__version__,
-            config_source=str(config.source_path or "defaults"),
         )
-        router = Router(config, ledger=ledger, runlog=runlog, scanner=scanner)
-        state = AgentState(run_id=run_id, goal="models test")
-        keyring = CacheKeyring(run_id=run_id, worktree_root=paths.workspace)
 
-        try:
-            if not skip_probe:
-                for result in router.probe_caching():
-                    marker = "[green]yes[/]" if result.cache_capable else "[yellow]no[/]"
-                    console.print(
-                        f"cache probe {result.provider}/{result.model}: "
-                        f"{marker} — {result.evidence}"
-                    )
-
-            table = Table(
-                "tier",
-                "node",
-                "model",
-                "call",
-                "latency",
-                "in / cached",
-                "out",
-                "usd",
-                title="tier exercise",
-            )
-
-            for tier in (Tier.FLAGSHIP, Tier.MEDIUM, Tier.LIGHT):
-                if tier not in config.tiers:
-                    continue
-                role = _representative_node(config, tier)
-                builder = PromptBuilder(
-                    node=role,
-                    keyring=keyring,
-                    system_text=_TEST_SYSTEM_PROMPT,
-                    caching_enabled=config.caching.enabled,
+        if not skip_probe:
+            for result in ctx.router.probe_caching():
+                marker = "[green]yes[/]" if result.cache_capable else "[yellow]no[/]"
+                console.print(
+                    f"cache probe {result.provider}/{result.model}: {marker} — {result.evidence}"
                 )
-                for call_index in (1, 2):
-                    prompt = builder.build(_TEST_TURN)
-                    try:
-                        call = router.complete(role, prompt, state=state)
-                    except (ChainExhaustedError, UnsupportedProviderError) as exc:
-                        failures.append(f"{tier.value}: {exc}")
-                        table.add_row(
-                            tier.value,
-                            role.value,
-                            "—",
-                            str(call_index),
-                            "—",
-                            "—",
-                            "—",
-                            "[red]FAIL[/]",
-                        )
-                        break
-                    usage = call.record.usage
-                    table.add_row(
-                        tier.value if call_index == 1 else "",
-                        role.value if call_index == 1 else "",
-                        call.record.model_ref if call_index == 1 else "",
-                        str(call_index),
-                        f"{call.record.latency_ms:.0f}ms",
-                        f"{usage.input_tokens} / {usage.cache_read_tokens}",
-                        str(usage.output_tokens),
-                        "local" if call.record.usd == 0 else f"${call.record.usd:.5f}",
-                    )
-            console.print(table)
-        finally:
-            router.close()
-            runlog.event(EventKind.RUN_END, ok=not ledger.has_unpriced_calls)
 
-    cost_path = ledger.write(paths.cost)
-    _print_ledger_summary(ledger, cost_path)
+        table = Table(
+            "tier",
+            "node",
+            "model",
+            "call",
+            "latency",
+            "in / cached",
+            "out",
+            "usd",
+            title="tier exercise",
+        )
+
+        for tier in (Tier.FLAGSHIP, Tier.MEDIUM, Tier.LIGHT):
+            if tier not in config.tiers:
+                continue
+            role = _representative_node(config, tier)
+            builder = PromptBuilder(
+                node=role,
+                keyring=ctx.keyring,
+                system_text=_TEST_SYSTEM_PROMPT,
+                caching_enabled=config.caching.enabled,
+            )
+            for call_index in (1, 2):
+                prompt = builder.build(_TEST_TURN)
+                try:
+                    call = ctx.router.complete(role, prompt, state=ctx.state)
+                except (ChainExhaustedError, UnsupportedProviderError) as exc:
+                    failures.append(f"{tier.value}: {exc}")
+                    table.add_row(
+                        tier.value, role.value, "—", str(call_index), "—", "—", "—", "[red]FAIL[/]"
+                    )
+                    break
+                usage = call.record.usage
+                table.add_row(
+                    tier.value if call_index == 1 else "",
+                    role.value if call_index == 1 else "",
+                    call.record.model_ref if call_index == 1 else "",
+                    str(call_index),
+                    f"{call.record.latency_ms:.0f}ms",
+                    f"{usage.input_tokens} / {usage.cache_read_tokens}",
+                    str(usage.output_tokens),
+                    "local" if call.record.usd == 0 else f"${call.record.usd:.5f}",
+                )
+        console.print(table)
+
+    _print_ledger_summary(ctx.ledger, ctx.ledger.write(ctx.paths.cost))
 
     if failures:
         for failure in failures:
@@ -349,7 +417,7 @@ def models_test(
 @app.command()
 def run(
     goal: Annotated[str, typer.Argument(help="What the harness should accomplish.")],
-    config_path: Annotated[Path | None, typer.Option("--config", "-c")] = None,
+    config_path: ConfigOption = None,
     repo: Annotated[
         Path, typer.Option("--repo", help="Source repository copied into a throwaway worktree.")
     ] = Path("."),
@@ -376,41 +444,121 @@ def run(
     written objections. Operates on a throwaway copy of `repo` under
     .xeno/worktrees/<run_id>, never the user's working tree.
     """
+    config = _resolve_config(config_path)
+    _preflight(config)
+
+    repo_root = repo.resolve()
+    final_state: AgentState | None = None
+
+    with ExitStack() as stack:
+        ctx, runlog = _start_run(
+            config,
+            stack,
+            repo_root=repo_root,
+            state_goal=goal,
+            succeeded=lambda: bool(final_state and final_state.review_verdict is Verdict.APPROVE),
+            keyring_on_worktree=True,
+            command="run",
+            goal=goal,
+        )
+        worktree = ctx.paths.worktree
+        _copy_into_worktree(repo_root, worktree, config)
+
+        # PRD S9.6.3: without this, `provider.cache_capable` stays None for
+        # the whole run, `supports_explicit_cache_markers()` is False for
+        # every aggregator, and no cache_control marker is ever emitted — so
+        # the caching design would be inert in exactly the mode M1.4
+        # measures. `probe_caching` is itself gated on
+        # `caching.probe_aggregators_at_startup`, and only aggregators are
+        # probed, so a purely local or Anthropic setup pays nothing here.
+        for probe in ctx.router.probe_caching():
+            if not probe.cache_capable:
+                _warn(f"cache probe {probe.provider}/{probe.model}: {probe.evidence}")
+
+        # Discovery needs `router`/`state` (PRD S8.2 revised: the one model
+        # call that proposes which commands to run, cost-tracked like every
+        # other node call) BEFORE the sandbox pool can be built — the pool
+        # needs to know the image, and the image now depends on what
+        # discovery finds. A cache hit (the common case after the first run
+        # against a repo) costs zero model calls.
+        try:
+            toolchain = discover_toolchain(
+                router=ctx.router,
+                config=config,
+                keyring=ctx.keyring,
+                state=ctx.state,
+                repo_root=repo_root,
+                worktree=worktree,
+            )
+        except DiscoveryError as exc:
+            _error(f"toolchain discovery failed: {exc}")
+            raise typer.Exit(code=2) from exc
+
+        adapter = GenericAdapter(toolchain)
+        pool = _build_pool(stack, adapter, config, paths=ctx.paths, worktree=worktree)
+        _seed_context_files(ctx.state, worktree, context_files)
+
+        final_state = run_graph(
+            router=ctx.router,
+            config=config,
+            keyring=ctx.keyring,
+            paths=ctx.paths,
+            worktree=worktree,
+            runlog=runlog,
+            state=ctx.state,
+            pool=pool,
+            adapter=adapter,
+            repo_root=repo_root,
+        )
+
+    assert final_state is not None
+    _print_run_summary(final_state, worktree)
+    _print_ledger_summary(ctx.ledger, ctx.ledger.write(ctx.paths.cost))
+
+    branch = run_branch_name(config.git.branch_prefix, goal, ctx.run_id)
+    raise typer.Exit(code=_finalize(final_state, config, worktree, branch))
+
+
+def _preflight(config: XenoConfig) -> None:
+    """Environment and configuration checks that must happen before a run
+    creates anything — a missing `git` is worth catching before a worktree
+    copy, not after."""
     if shutil.which("git") is None:
-        console.print(
-            "[red]error:[/] git was not found on PATH — required for the checkpoint "
-            "substrate (PRD S13 Phase 3: every completed task is a commit, and a failed "
-            "one rolls back to the last one)"
+        _error(
+            "git was not found on PATH — required for the checkpoint substrate "
+            "(PRD S13 Phase 3: every completed task is a commit, and a failed one "
+            "rolls back to the last one)"
         )
         raise typer.Exit(code=2)
 
-    config = _resolve_config(config_path)
-    for warning in _capability_warnings(config):
-        console.print(f"[yellow]warning:[/] {warning}")
+    _print_capability_warnings(config)
     if config.sandbox.network == "open":
-        console.print(
-            "[yellow]warning:[/] sandbox network policy is 'open' (PRD S11.2) — "
-            "generated code has unrestricted egress for this run"
+        _warn(
+            "sandbox network policy is 'open' (PRD S11.2) — generated code has "
+            "unrestricted egress for this run"
         )
     if config.git.open_pr and shutil.which("gh") is None:
-        console.print(
-            "[yellow]warning:[/] git.open_pr is true but gh was not found on PATH — "
-            "PR creation will be skipped at the end of this run; the squashed commit "
-            "will still land on the preserved local branch."
+        _warn(
+            "git.open_pr is true but gh was not found on PATH — PR creation will be "
+            "skipped at the end of this run; the squashed commit will still land on "
+            "the preserved local branch."
         )
 
-    run_id = new_run_id()
-    repo_root = repo.resolve()
-    paths = RunPaths(repo_root=repo_root, run_id=run_id).ensure()
-    worktree = paths.worktree
-    _copy_into_worktree(repo_root, worktree, config)
 
-    ledger = CostLedger(run_id=run_id, caching_enabled=config.caching.enabled)
-    scanner = SecretScanner(entropy_threshold=config.secrets.entropy_threshold)
-    final_state: AgentState | None = None
-
-    adapter = PythonAdapter()
+def _build_pool(
+    stack: ExitStack,
+    adapter: GenericAdapter,
+    config: XenoConfig,
+    *,
+    paths: RunPaths,
+    worktree: Path,
+) -> WarmPool:
+    """Bring up the gate image and its warm pool, registering teardown for
+    each as it is acquired — a failure partway through (image build, a
+    container that will not start) must not strand the ones already up."""
     docker_client = docker.from_env()
+    stack.callback(docker_client.close)
+
     image, network_disabled = prepare_gate_image(
         docker_client,
         adapter,
@@ -427,100 +575,71 @@ def run(
         image=image,
         network_disabled=network_disabled,
     )
+    stack.callback(pool.shutdown)
     pool.fill()
+    return pool
 
-    with RunLog(paths.events, run_id=run_id) as runlog:
-        runlog.event(
-            EventKind.RUN_START,
-            command="run",
-            goal=goal,
-            xeno_version=__version__,
-            config_source=str(config.source_path or "defaults"),
+
+def _seed_context_files(state: AgentState, worktree: Path, rels: list[str] | None) -> None:
+    """PRD S13 Phase 3: `--file` only ADDS to what Argus finds on its own, so
+    a bad path is a usage error worth failing on rather than quietly
+    dropping."""
+    for rel in rels or []:
+        target = worktree / rel
+        if not target.exists():
+            _error(f"--file {rel} not found under {worktree}")
+            raise typer.Exit(code=2)
+        state.context_handles = [
+            *state.context_handles,
+            Handle.for_file(target, summary=f"user-provided context: {rel}"),
+        ]
+
+
+def _finalize(
+    state: AgentState, config: XenoConfig, worktree: Path, branch: str
+) -> int:
+    """The post-graph disposition (PRD S8.1, S8.4), returning the process
+    exit code rather than raising, so the decision stays testable
+    independently of Typer."""
+    if state.review_verdict is Verdict.APPROVE:
+        if _human_gate(state, worktree, branch) != "approve":
+            console.print(f"[yellow]declined by human — branch preserved, un-squashed:[/] {branch}")
+            return 1
+        assert state.commit_message is not None
+        vcs.squash_to_one_commit(
+            worktree, since=vcs.root_commit(worktree), message=state.commit_message
         )
-        router = Router(config, ledger=ledger, runlog=runlog, scanner=scanner)
-        state = AgentState(run_id=run_id, goal=goal)
-        keyring = CacheKeyring(run_id=run_id, worktree_root=worktree)
+        console.print(f"[green]squashed[/] onto {branch}")
+        if config.git.open_pr:
+            _open_pr(state, worktree, branch)
+        return 0
 
-        for rel in context_files or []:
-            target = worktree / rel
-            if not target.exists():
-                console.print(f"[red]error:[/] --file {rel} not found under {worktree}")
-                router.close()
-                pool.shutdown()
-                docker_client.close()
-                raise typer.Exit(code=2)
-            state.context_handles = [
-                *state.context_handles,
-                Handle.for_file(target, summary=f"user-provided context: {rel}"),
-            ]
+    if state.review_verdict is Verdict.ESCALATE:
+        _print_escalate_report(state, branch)
+        return 1
+    return 0 if _run_succeeded(state) else 1
 
-        try:
-            final_state = run_graph(
-                router=router,
-                config=config,
-                keyring=keyring,
-                paths=paths,
-                worktree=worktree,
-                runlog=runlog,
-                state=state,
-                pool=pool,
-                adapter=adapter,
-                repo_root=repo_root,
-            )
-        finally:
-            router.close()
-            pool.shutdown()
-            docker_client.close()
-            ok = bool(final_state and final_state.review_verdict is Verdict.APPROVE)
-            runlog.event(EventKind.RUN_END, ok=ok)
 
-    cost_path = ledger.write(paths.cost)
-    assert final_state is not None
-    _print_run_summary(final_state, worktree)
-    _print_ledger_summary(ledger, cost_path)
-
-    #: Mirrors `build_graph`'s own branch-name formula exactly (goal, run_id,
-    #: `config.git.branch_prefix`) — recomputed here rather than threaded
-    #: back through `run_graph`'s return value, since it's a pure function of
-    #: inputs `run()` already has.
-    branch = f"{config.git.branch_prefix}{slugify(goal)}-{short_run_id(run_id)}"
-
-    if final_state.review_verdict is Verdict.APPROVE:
-        decision = _human_gate(final_state, worktree, branch)
-        if decision == "approve":
-            assert final_state.commit_message is not None
-            since = vcs.root_commit(worktree)
-            vcs.squash_to_one_commit(worktree, since=since, message=final_state.commit_message)
-            console.print(f"[green]squashed[/] onto {branch}")
-            if config.git.open_pr:
-                pushed = vcs.push_branch(worktree, branch)
-                pr_url = (
-                    vcs.open_pr(
-                        worktree,
-                        branch=branch,
-                        title=final_state.commit_message.splitlines()[0],
-                        body=final_state.commit_message,
-                    )
-                    if pushed
-                    else None
-                )
-                if pr_url:
-                    console.print(f"[green]opened PR:[/] {pr_url}")
-                else:
-                    console.print(
-                        "[yellow]warning:[/] PR creation was skipped or failed — the "
-                        f"squashed commit is still on the preserved branch {branch}."
-                    )
-        else:
-            console.print(
-                f"[yellow]declined by human — branch preserved, un-squashed:[/] {branch}"
-            )
-            raise typer.Exit(code=1)
-    elif final_state.review_verdict is Verdict.ESCALATE:
-        _print_escalate_report(final_state, branch)
-        raise typer.Exit(code=1)
-    elif not _run_succeeded(final_state):
-        raise typer.Exit(code=1)
+def _open_pr(state: AgentState, worktree: Path, branch: str) -> None:
+    assert state.commit_message is not None
+    pushed = vcs.push_branch(worktree, branch)
+    pr_url = (
+        vcs.open_pr(
+            worktree,
+            branch=branch,
+            title=state.commit_message.splitlines()[0],
+            body=state.commit_message,
+        )
+        if pushed
+        else None
+    )
+    if pr_url:
+        console.print(f"[green]opened PR:[/] {pr_url}")
+    else:
+        _warn(
+            "PR creation was skipped or failed — the squashed commit is still on "
+            f"the preserved branch {branch}."
+        )
 
 
 def _run_succeeded(state: AgentState) -> bool:
@@ -550,7 +669,7 @@ def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["appr
 
     console.print(Panel(state.commit_message, title="proposed commit message"))
     console.print(Panel(state.cerberus_notes.read_text(), title="Cerberus's notes"))
-    console.print(f"diff: {state.review_diff_handle.path} ({state.review_diff_handle.bytes} bytes)")
+    _print_diff_line(state.review_diff_handle)
     console.print(f"branch: {branch}")
 
     while True:
@@ -562,6 +681,10 @@ def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["appr
                 console.print(state.review_diff_handle.read_text())
             continue
         return "approve" if choice == "approve" else "reject"
+
+
+def _print_diff_line(handle: Handle) -> None:
+    console.print(f"diff: {handle.path} ({handle.bytes} bytes)")
 
 
 def _print_escalate_report(state: AgentState, branch: str) -> None:
@@ -584,9 +707,7 @@ def _print_escalate_report(state: AgentState, branch: str) -> None:
         console.print(Panel(state.cerberus_notes.read_text(), title="Cerberus's escalation report"))
 
     if state.review_diff_handle is not None:
-        console.print(
-            f"diff: {state.review_diff_handle.path} ({state.review_diff_handle.bytes} bytes)"
-        )
+        _print_diff_line(state.review_diff_handle)
     if state.eval_report is not None:
         console.print(f"last evaluation: {state.eval_report}")
     if state.checkpoints:
@@ -623,22 +744,10 @@ def _print_run_summary(state: AgentState, worktree: Path) -> None:
 
     if report is not None:
         table = Table("gate", "result", title="evaluation")
-        table.add_row("parse", "[green]ok[/]" if report.parse_ok else "[red]fail[/]")
-        table.add_row(
-            "lint", "[green]0[/]" if report.lint_errors == 0 else f"[red]{report.lint_errors}[/]"
-        )
-        table.add_row(
-            "types", "[green]0[/]" if report.type_errors == 0 else f"[red]{report.type_errors}[/]"
-        )
-        table.add_row(
-            "tests",
-            f"[green]{report.tests_run}/{report.tests_run}[/]"
-            if report.tests_failed == 0
-            else f"[red]{report.tests_failed} failed[/] of {report.tests_run}",
-        )
-        if report.coverage_delta is not None:
-            arrow = "+" if report.coverage_delta >= 0 else ""
-            table.add_row("coverage delta", f"{arrow}{report.coverage_delta:.1f}pp")
+        if report.passed:
+            table.add_row("required commands", "[green]all passed[/]")
+        else:
+            table.add_row("failed command", f"[red]{report.failed_command or 'infrastructure'}[/]")
         console.print(table)
         if report.first_failure:
             console.print(Panel(report.first_failure, title="first failure"))
@@ -756,7 +865,6 @@ limits:
 
 git:
   branch_prefix: "xeno/"
-  squash_per_run: true   # v1 always squashes per-run (PRD OQ-4)
   open_pr: false          # set true + install `gh` to open a PR on APPROVE
 
 caching:

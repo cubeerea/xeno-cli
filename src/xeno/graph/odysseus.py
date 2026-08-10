@@ -19,6 +19,7 @@ from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
+from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import Plan, PlanTask, read_plan, write_plan
 from xeno.graph.prompts import (
     ODYSSEUS_CERBERUS_REJECT_PREFIX,
@@ -30,9 +31,6 @@ from xeno.graph.prompts import (
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
-
-#: Same rationale as Daedalus's: one corrective nudge, not an open loop.
-_MAX_FORMAT_ATTEMPTS = 2
 
 #: PRD S7.2: L4 is a re-plan. `AgentState.ladder_rung` reaching this value is
 #: how the node tells "initial plan" from "revise the stuck task" apart —
@@ -65,11 +63,7 @@ def _build_current_turn(
     assert report is not None, "a replan only happens after a task has failed"
     lines.append("")
     lines.append(ODYSSEUS_REPLAN_PREFIX)
-    lines.append(
-        f"Stuck task failed with: parse_ok={report.parse_ok} "
-        f"lint_errors={report.lint_errors} type_errors={report.type_errors} "
-        f"tests_failed={report.tests_failed}/{report.tests_run}"
-    )
+    lines.append(f"Stuck task failed with: failed_command={report.failed_command!r}")
     if report.first_failure:
         lines.append(f"Critical failure detail: {report.first_failure}")
     return "\n".join(lines)
@@ -110,24 +104,20 @@ def make_odysseus_node(
             state, skeleton_text, is_l4_replan=is_l4_replan, is_cerberus_reject=is_cerberus_reject
         )
 
-        output = None
-        for attempt in range(_MAX_FORMAT_ATTEMPTS):
-            turn_text = current_turn if attempt == 0 else ODYSSEUS_FORMAT_CORRECTION
-            prompt = builder.build(turn_text)
-            try:
-                result = router.complete(NodeRole.PLANNER, prompt, state=state)
-            except ChainExhaustedError as exc:
-                state.halt_reason = f"odysseus: {exc}"
-                return state
+        try:
+            output = complete_with_format_retry(
+                router=router,
+                builder=builder,
+                node=NodeRole.PLANNER,
+                state=state,
+                current_turn=current_turn,
+                correction=ODYSSEUS_FORMAT_CORRECTION,
+                parse=parse_odysseus_output,
+            )
+        except ChainExhaustedError as exc:
+            state.halt_reason = f"odysseus: {exc}"
+            return state
 
-            builder.append_turn("user", turn_text)
-            builder.append_turn("assistant", result.text)
-
-            output = parse_odysseus_output(result.text)
-            if not output.malformed:
-                break
-
-        assert output is not None
         if output.is_objection:
             state.halt_reason = f"odysseus objection: {output.objection}"
             return state

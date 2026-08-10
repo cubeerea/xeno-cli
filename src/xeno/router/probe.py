@@ -41,16 +41,7 @@ class ProbeResult:
     model: str
     cache_capable: bool
     evidence: str
-    first_latency_ms: float = 0.0
-    second_latency_ms: float = 0.0
-    cached_tokens_reported: int = 0
     error: str | None = None
-
-    @property
-    def latency_delta_pct(self) -> float | None:
-        if not self.first_latency_ms:
-            return None
-        return (self.first_latency_ms - self.second_latency_ms) / self.first_latency_ms * 100
 
 
 def _probe_prefix() -> str:
@@ -100,7 +91,9 @@ def probe_provider(provider: Provider, model: ModelSpec) -> ProbeResult:
 
     prompt = _probe_prompt()
     try:
-        first = provider.complete(prompt, model, max_tokens=8, temperature=0.0)
+        # The first call's RESULT is irrelevant — it exists to populate the
+        # provider's cache so the second call has something to hit.
+        provider.complete(prompt, model, max_tokens=8, temperature=0.0)
         # A brief pause: some providers populate the cache asynchronously and
         # a back-to-back second call can miss a cache that does in fact work.
         time.sleep(1.0)
@@ -135,9 +128,6 @@ def probe_provider(provider: Provider, model: ModelSpec) -> ProbeResult:
         model=model.model,
         cache_capable=capable,
         evidence=evidence,
-        first_latency_ms=first.latency_ms,
-        second_latency_ms=second.latency_ms,
-        cached_tokens_reported=cached,
     )
 
 
