@@ -13,6 +13,7 @@ from pathlib import Path
 
 from xeno.core import vcs
 from xeno.core.breakers import reset_for_new_task
+from xeno.core.ledger import CostLedger
 from xeno.core.state import AgentState, CommitRef
 from xeno.graph.plan import current_task, read_plan
 
@@ -22,7 +23,7 @@ from xeno.graph.plan import current_task, read_plan
 _MAX_MESSAGE_CHARS = 200
 
 
-def checkpoint_step(state: AgentState, worktree: Path) -> None:
+def checkpoint_step(state: AgentState, worktree: Path, ledger: CostLedger) -> None:
     """Commit the just-passed task's state and advance to the next one.
 
     Call this ONLY after Talos reports a pass — `xeno.graph.build`'s
@@ -31,6 +32,11 @@ def checkpoint_step(state: AgentState, worktree: Path) -> None:
     `task_cursor` must happen in the same step, or a later halt mid-way
     through the next task would leave `state.checkpoints` and `task_cursor`
     disagreeing about which task is "current."
+
+    This is also the only point in a run where a task is definitively
+    complete, so it is where M1.3's per-task cost window closes
+    (`CostLedger.complete_task`) — a run that halts mid-task correctly
+    contributes nothing to the median.
     """
     assert state.plan is not None, "checkpointing only happens once a plan exists"
     plan = read_plan(state.plan)
@@ -42,6 +48,14 @@ def checkpoint_step(state: AgentState, worktree: Path) -> None:
         *state.checkpoints,
         CommitRef(sha=sha, task_index=state.task_cursor, message=message, created_at=time.time()),
     ]
+    if state.eval_report is not None:
+        # Carried up to the run level before `reset_for_new_task` clears the
+        # task's own bookkeeping — Cerberus needs it at the END of the run.
+        state.touched_test_files = sorted(
+            {*state.touched_test_files, *state.eval_report.touched_test_files}
+        )
+
+    ledger.complete_task()
     reset_for_new_task(state)
     state.task_cursor += 1
 

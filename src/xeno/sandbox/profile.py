@@ -35,9 +35,30 @@ from xeno.core.config import SandboxConfig
 WORKSPACE_MOUNT = "/workspace"
 
 #: PRD S11.1: non-root. Matches the `useradd --uid 65532` in the adapter's
-#: Dockerfile (xeno.adapters.python.DOCKERFILE) — an arbitrary but fixed and
+#: Dockerfile (xeno.adapters.generic.DOCKERFILE) — an arbitrary but fixed and
 #: unprivileged UID, chosen above the usual 1-fixed-digit system range.
 SANDBOX_UID = 65532
+
+
+def _base_kwargs(image: str, scratch_dir: Path, config: SandboxConfig) -> dict[str, Any]:
+    """The settings both profiles share. Kept in one place so a hardening
+    change (a dropped capability, a resource cap) cannot land on the gate
+    profile and silently miss the install profile — the two differ in exactly
+    three keys, and those three are the only ones stated at the call sites
+    below."""
+    return {
+        "image": image,
+        "command": ["sleep", "infinity"],
+        "detach": True,
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges"],
+        "tmpfs": {"/tmp": "rw,size=256m"},
+        "mem_limit": config.memory,
+        "nano_cpus": int(config.cpus * 1_000_000_000),
+        "pids_limit": config.pids_limit,
+        "volumes": {str(scratch_dir): {"bind": WORKSPACE_MOUNT, "mode": "rw"}},
+        "working_dir": WORKSPACE_MOUNT,
+    }
 
 
 def container_kwargs(
@@ -49,20 +70,10 @@ def container_kwargs(
 ) -> dict[str, Any]:
     """The hardened profile: what every Talos/Chiron gate-run container uses."""
     return {
-        "image": image,
-        "command": ["sleep", "infinity"],
-        "detach": True,
+        **_base_kwargs(image, scratch_dir, config),
         "user": f"{SANDBOX_UID}:{SANDBOX_UID}",
-        "cap_drop": ["ALL"],
-        "security_opt": ["no-new-privileges"],
         "read_only": True,
-        "tmpfs": {"/tmp": "rw,size=256m"},
-        "mem_limit": config.memory,
-        "nano_cpus": int(config.cpus * 1_000_000_000),
-        "pids_limit": config.pids_limit,
         "network_disabled": network_disabled,
-        "volumes": {str(scratch_dir): {"bind": WORKSPACE_MOUNT, "mode": "rw"}},
-        "working_dir": WORKSPACE_MOUNT,
     }
 
 
@@ -80,19 +91,12 @@ def install_container_kwargs(
     Network is left enabled here — the caller is responsible for committing
     the result and discarding this container before any generated code runs
     against it.
+
+    Note the three differences from `container_kwargs`, and only those three:
+    no `user` (so root), a writable root filesystem, and network on.
     """
     return {
-        "image": image,
-        "command": ["sleep", "infinity"],
-        "detach": True,
-        "cap_drop": ["ALL"],
-        "security_opt": ["no-new-privileges"],
+        **_base_kwargs(image, scratch_dir, config),
         "read_only": False,
-        "tmpfs": {"/tmp": "rw,size=256m"},
-        "mem_limit": config.memory,
-        "nano_cpus": int(config.cpus * 1_000_000_000),
-        "pids_limit": config.pids_limit,
         "network_disabled": False,
-        "volumes": {str(scratch_dir): {"bind": WORKSPACE_MOUNT, "mode": "rw"}},
-        "working_dir": WORKSPACE_MOUNT,
     }

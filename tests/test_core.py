@@ -69,17 +69,15 @@ def test_handle_summary_is_truncated_not_rejected(tmp_path: Path) -> None:
     assert len(handle.summary) <= 200
 
 
-def test_eval_report_passes_only_when_every_gate_is_green() -> None:
-    assert EvalReport(parse_ok=True).passed
-    assert not EvalReport(parse_ok=False).passed
-    assert not EvalReport(parse_ok=True, lint_errors=1).passed
-    assert not EvalReport(parse_ok=True, type_errors=1).passed
-    assert not EvalReport(parse_ok=True, tests_failed=1).passed
-
-
-def test_infrastructure_failure_is_never_a_pass() -> None:
-    """A sandbox that failed to provision is not a green run (PRD S10, Talos)."""
-    assert not EvalReport(parse_ok=True, infrastructure_failure=True).passed
+def test_eval_report_defaults_to_not_passed() -> None:
+    """`passed` is stored directly (PRD S12 revised: `xeno.graph.gates.
+    run_gates` computes it from exit codes, not a fixed set of sub-counts to
+    derive it from here) — an unset report defaults closed, not open. The
+    "never a pass" invariants themselves (infrastructure failure, a failed
+    required command) are `run_gates`'s job now, covered in `test_gates.py`.
+    """
+    assert not EvalReport().passed
+    assert EvalReport(passed=True).passed
 
 
 # ---- config (PRD S9.5) -----------------------------------------------------
@@ -265,6 +263,29 @@ def test_m1_3_reports_the_median_over_completed_tasks() -> None:
     for usd in (0.10, 0.40, 0.90):
         ledger.mark_task_completed(usd)
     assert ledger.metrics()["M1.3_median_usd_per_completed_task"] == 0.40
+
+
+def test_completing_a_task_attributes_everything_spent_since_the_last_one() -> None:
+    """M1.3 measures what a completed task COSTS, so a task's failed attempts
+    and ladder climbs count against it, not just its final green attempt."""
+    ledger = CostLedger(run_id="t")
+    ledger.record(_record(usd=0.10))
+    ledger.record(_record(usd=0.05))  # a failed attempt at the same task
+    assert ledger.complete_task() == pytest.approx(0.15)
+
+    ledger.record(_record(usd=0.40))
+    assert ledger.complete_task() == pytest.approx(0.40)
+
+    assert ledger.metrics()["M1.3_median_usd_per_completed_task"] == pytest.approx(0.275)
+
+
+def test_a_run_that_never_completes_a_task_reports_no_m1_3() -> None:
+    """Spend on a task that halted mid-way must not be attributed to a
+    completed one — `complete_task` is only ever called at a checkpoint."""
+    ledger = CostLedger(run_id="t")
+    ledger.record(_record(usd=0.90))
+    assert ledger.metrics()["M1.3_median_usd_per_completed_task"] is None
+    assert ledger.metrics()["M1.3_completed_tasks"] == 0
 
 
 def test_metrics_are_none_rather_than_zero_when_nothing_was_measured() -> None:

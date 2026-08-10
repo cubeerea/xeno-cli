@@ -23,8 +23,7 @@ from pathlib import Path
 import docker
 import pytest
 
-from xeno.adapters.base import LanguageAdapter
-from xeno.adapters.python import PythonAdapter
+from xeno.adapters.generic import DiscoveredCommand, DiscoveredToolchain, GenericAdapter
 from xeno.core.config import Limits, ProviderSpec, SandboxConfig, XenoConfig
 from xeno.core.ledger import CostLedger
 from xeno.core.paths import RunPaths
@@ -37,7 +36,27 @@ from xeno.graph.gates import GateOutcome
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.providers.base import CompletionResult, Provider, ProviderError
 from xeno.router.router import Router
-from xeno.sandbox.pool import WarmPool
+from xeno.sandbox.pool import WarmPool, _ensure_image
+
+#: What `GenericAdapter.image()`'s DOCKERFILE already provides (ruff, mypy,
+#: pytest) — mirrors the old hardcoded PythonAdapter gate chain minus the
+#: dedicated parse step, since `ruff check`/`mypy` already surface syntax
+#: errors and the new gate chain has no per-file targeting to hand a parse
+#: step (PRD S12 revised: commands are discovered/static, not touched-files-
+#: scoped).
+_TEST_TOOLCHAIN = DiscoveredToolchain(
+    install=None,
+    required=(
+        DiscoveredCommand(name="lint", argv=("python3", "-m", "ruff", "check", ".")),
+        DiscoveredCommand(
+            name="typecheck",
+            argv=("python3", "-m", "mypy", "--no-error-summary", "--hide-error-context", "."),
+        ),
+        DiscoveredCommand(name="test", argv=("python3", "-m", "pytest", "-q", "--tb=short")),
+    ),
+    advisory=(),
+    fingerprint="test-fixture",
+)
 
 DAEDALUS_OK = '<xeno-file path="pkg/mod.py">x = 1\n</xeno-file>'
 CHIRON_PATCH_OK = '<xeno-file path="pkg/mod.py">x = 2\n</xeno-file>'
@@ -169,32 +188,21 @@ class FakePool:
         pass
 
 
-def pass_outcome(*, coverage_percent: float | None = None) -> GateOutcome:
+def pass_outcome() -> GateOutcome:
     return GateOutcome(
-        parse_ok=True,
-        lint_errors=0,
-        type_errors=0,
-        tests_run=3,
-        tests_failed=0,
-        failing_test_ids=(),
-        exception_type="",
-        failing_location="",
+        passed=True,
+        failed_command="",
+        exit_code=0,
         infrastructure_failure=False,
-        coverage_percent=coverage_percent,
         log="all green",
     )
 
 
 def fail_outcome(*, signature: str = "A") -> GateOutcome:
     return GateOutcome(
-        parse_ok=True,
-        lint_errors=0,
-        type_errors=0,
-        tests_run=3,
-        tests_failed=1,
-        failing_test_ids=(f"tests/test_x.py::test_{signature}",),
-        exception_type="AssertionError",
-        failing_location=f"tests/test_x.py:{signature}",
+        passed=False,
+        failed_command="test",
+        exit_code=1,
         infrastructure_failure=False,
         log=f"FAILED tests/test_x.py::test_{signature} - AssertionError: nope",
     )
@@ -242,7 +250,7 @@ def _run(
     reviewer_text: str | Callable[[], str] = CERBERUS_APPROVE,
     fail_reviewer: bool = False,
     pool: object | None = None,
-    adapter: LanguageAdapter | None = None,
+    adapter: GenericAdapter | None = None,
 ) -> tuple[AgentState, ScriptedProvider]:
     ledger = CostLedger(run_id="t")
     router = Router(graph_config, ledger=ledger)
@@ -269,7 +277,7 @@ def _run(
         runlog=NullRunLog(),
         state=state,
         pool=pool or FakePool(),  # type: ignore[arg-type]
-        adapter=adapter or PythonAdapter(),
+        adapter=adapter or GenericAdapter(_TEST_TOOLCHAIN),
         repo_root=run_paths.repo_root,
     )
     return final, fake
@@ -278,7 +286,7 @@ def _run(
 def _script_gates(monkeypatch: pytest.MonkeyPatch, outcomes: list[GateOutcome]) -> None:
     queue = list(outcomes)
 
-    def fake_run_gates(sandbox, adapter, worktree, touched_files):  # type: ignore[no-untyped-def]
+    def fake_run_gates(sandbox, toolchain):  # type: ignore[no-untyped-def]
         return queue.pop(0) if queue else outcomes[-1]
 
     monkeypatch.setattr("xeno.graph.talos.run_gates", fake_run_gates)
@@ -303,7 +311,7 @@ requires_docker = pytest.mark.skipif(
 @pytest.fixture
 def real_pool(tmp_path: Path) -> Iterator[WarmPool]:
     client = docker.from_env()
-    adapter = PythonAdapter()
+    adapter = GenericAdapter(_TEST_TOOLCHAIN)
     pool = WarmPool(
         client,
         adapter,
@@ -311,7 +319,7 @@ def real_pool(tmp_path: Path) -> Iterator[WarmPool]:
         workspace_root=tmp_path / "sandboxes",
         network_disabled=True,
     )
-    pool.ensure_image()
+    _ensure_image(client, adapter.image(), adapter.dockerfile())
     pool.fill()
     try:
         yield pool
@@ -637,14 +645,9 @@ def test_infrastructure_failure_gets_one_l0_retry_then_halts_without_a_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     infra = GateOutcome(
-        parse_ok=False,
-        lint_errors=0,
-        type_errors=0,
-        tests_run=0,
-        tests_failed=0,
-        failing_test_ids=(),
-        exception_type="",
-        failing_location="",
+        passed=False,
+        failed_command="lint",
+        exit_code=None,
         infrastructure_failure=True,
         log="INFRASTRUCTURE: ruff not found",
     )
@@ -983,3 +986,59 @@ def test_cerberus_chain_exhaustion_escalates_as_unreviewed(
     assert final.cerberus_notes is None
     assert final.review_diff_handle is not None  # still computed before the call was attempted
     assert fake.calls.count(NodeRole.REVIEWER) == 1  # the attempt was made and failed
+
+
+# ---- test-file guardrail (PRD S10) -----------------------------------------
+
+
+def test_passing_tasks_accumulate_touched_test_files_onto_the_run(tmp_path: Path) -> None:
+    """`EvalReport` is per-task and is overwritten by the next task, but
+    Cerberus reviews the whole run at the end — so the flag has to be carried
+    up to run level as each task checkpoints."""
+    from xeno.core import vcs
+    from xeno.core.ledger import CostLedger
+    from xeno.core.state import EvalReport, Handle
+    from xeno.graph.checkpoints import checkpoint_step
+    from xeno.graph.plan import Plan, PlanTask, write_plan
+
+    plan_path = tmp_path / "plan.json"
+    write_plan(
+        plan_path,
+        Plan(
+            tasks=[
+                PlanTask(description="a", acceptance="x"),
+                PlanTask(description="b", acceptance="y"),
+            ]
+        ),
+    )
+    vcs.init_repo(tmp_path)
+
+    state = AgentState(run_id="r", goal="g")
+    state.plan = Handle.for_file(plan_path, summary="plan")
+    ledger = CostLedger(run_id="r")
+
+    state.eval_report = EvalReport(passed=True, touched_test_files=["tests/test_a.py"])
+    checkpoint_step(state, tmp_path, ledger)
+    state.eval_report = EvalReport(passed=True, touched_test_files=["tests/test_b.py"])
+    checkpoint_step(state, tmp_path, ledger)
+
+    assert state.touched_test_files == ["tests/test_a.py", "tests/test_b.py"]
+
+
+def test_cerberus_is_told_when_the_run_modified_test_files() -> None:
+    """Chiron is refused outright for touching a test file, but Daedalus
+    writes tests legitimately — telling the two apart is Cerberus's call, so
+    the fact must actually reach its prompt."""
+    from xeno.graph.cerberus import _build_current_turn
+    from xeno.graph.plan import Plan, PlanTask
+
+    state = AgentState(run_id="r", goal="add rate limiting")
+    plan = Plan(tasks=[PlanTask(description="a", acceptance="x")])
+
+    clean = _build_current_turn(state, plan, "diff")
+    assert "modified test file(s)" not in clean
+
+    state.touched_test_files = ["tests/test_limits.py"]
+    flagged = _build_current_turn(state, plan, "diff")
+    assert "modified test file(s): tests/test_limits.py" in flagged
+    assert "weakened to make the gates pass" in flagged

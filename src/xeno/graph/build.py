@@ -27,7 +27,7 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from xeno.adapters.base import LanguageAdapter
+from xeno.adapters.generic import GenericAdapter
 from xeno.core import vcs
 from xeno.core.breakers import (
     BreakerPanel,
@@ -36,7 +36,7 @@ from xeno.core.breakers import (
     record_diff,
 )
 from xeno.core.config import XenoConfig
-from xeno.core.paths import RunPaths, short_run_id, slugify
+from xeno.core.paths import RunPaths, run_branch_name
 from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import RUNG_BUDGETS, LadderRung, NodeRole, Verdict
@@ -131,7 +131,7 @@ def build_graph(
     worktree: Path,
     runlog: RunLog,
     pool: WarmPool,
-    adapter: LanguageAdapter,
+    adapter: GenericAdapter,
     goal: str,
     repo_root: Path,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
@@ -149,7 +149,7 @@ def build_graph(
     #: PRD S8.4: every run operates on its own dedicated branch. Created
     #: right after `init_repo` so the whole run, including any L3 rollback,
     #: happens on it rather than a detached/default one.
-    branch = f"{config.git.branch_prefix}{slugify(goal)}-{short_run_id(paths.run_id)}"
+    branch = run_branch_name(config.git.branch_prefix, goal, paths.run_id)
     vcs.create_branch(worktree, branch)
     if config.git.open_pr:
         vcs.inherit_origin_remote(worktree, repo_root)
@@ -319,7 +319,7 @@ def build_graph(
         passed = state.eval_report.passed if state.eval_report else None
         runlog.event(EventKind.NODE_EXIT, node="talos", passed=passed)
         if passed:
-            checkpoint_step(state, worktree)
+            checkpoint_step(state, worktree, router.ledger)
             runlog.event(
                 EventKind.CHECKPOINT,
                 task_index=state.checkpoints[-1].task_index,
@@ -353,8 +353,8 @@ def build_graph(
             # PRD S10: infra failures get one L0 retry, then straight to
             # ESCALATE — never a patch/re-research/rewrite, since there is
             # no CODE defect for any of Argus/Chiron/Daedalus/Odysseus to
-            # act on. Phase 3 still has no Cerberus (PRD S13 Phase 4), so
-            # ESCALATE == halt regardless of how many ladder rungs exist.
+            # act on. `halt_reason` routes to Cerberus, which reports the
+            # decision deterministically rather than spending a review call.
             if state.ladder_rung == _L0_RUNG and state.rung_attempts < RUNG_BUDGETS[_L0_RUNG]:
                 state.rung_attempts += 1
                 ctx.intervention = Intervention.NONE
@@ -492,7 +492,7 @@ def run_graph(
     runlog: RunLog,
     state: AgentState,
     pool: WarmPool,
-    adapter: LanguageAdapter,
+    adapter: GenericAdapter,
     repo_root: Path,
 ) -> AgentState:
     """Compile and run the graph to completion, returning the final state."""

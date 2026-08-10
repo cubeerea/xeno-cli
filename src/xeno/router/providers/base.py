@@ -55,7 +55,6 @@ class CompletionResult:
     #: not a per-block split, so this is attributed by the router from the
     #: prompt's own block sizes (see `attribute_cache_to_breakpoints`).
     by_breakpoint: dict[Breakpoint, BreakpointStats] = field(default_factory=dict)
-    raw: dict[str, Any] = field(default_factory=dict)
 
 
 class Provider(ABC):
@@ -116,6 +115,16 @@ class Provider(ABC):
 
     # ---- shared helpers -------------------------------------------------
 
+    def supports_prefix_cache(self) -> bool:
+        """Whether this backend reuses a KV cache across calls (PRD S9.6.3).
+
+        Defaults to False so the router's local-backend warning fires for any
+        provider that has not explicitly claimed the capability — the
+        conservative direction, since a wrong True silently costs full-prefix
+        reprocessing on every Daedalus/Chiron/Talos call.
+        """
+        return False
+
     def supports_explicit_cache_markers(self) -> bool:
         """Whether this provider wants cache_control breakpoints emitted.
 
@@ -129,7 +138,15 @@ class Provider(ABC):
             return self.cache_capable is True
         return False
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any]) -> tuple[dict[str, Any], float]:
+        """Returns `(body, latency_ms)`.
+
+        Latency travels alongside the body rather than inside it: injecting a
+        private `_latency_ms` key mutated the provider's own response, lied
+        about the declared `dict[str, Any]` return type whenever an endpoint
+        answered with a JSON array, and left every caller reaching for a key
+        that no provider actually sends.
+        """
         started = time.perf_counter()
         try:
             response = self.client.post(path, json=payload)
@@ -153,13 +170,37 @@ class Provider(ABC):
                 retryable=_is_retryable_status(response.status_code),
             )
         try:
-            body: dict[str, Any] = response.json()
+            body = response.json()
         except ValueError as exc:
             raise ProviderError(
                 f"non-JSON response: {response.text[:200]}", provider=self.name, retryable=True
             ) from exc
-        body["_latency_ms"] = elapsed_ms
-        return body
+        if not isinstance(body, dict):
+            raise ProviderError(
+                f"expected a JSON object, got {type(body).__name__}",
+                provider=self.name,
+                retryable=True,
+            )
+        return body, elapsed_ms
+
+
+def plain_messages(prompt: AssembledPrompt) -> list[dict[str, Any]]:
+    """Static-first messages with no cache markers: the system region, then
+    history, then the current turn (PRD S9.6.2).
+
+    Shared because it is the ONLY shape Ollama has and the shape every
+    OpenAI-compatible provider falls back to when explicit cache markers are
+    not warranted — the two were byte-for-byte the same logic. Order comes
+    from the assembled prompt, which already enforces it; this must not
+    reorder.
+    """
+    messages: list[dict[str, Any]] = []
+    static = [b.text for b in prompt.static_blocks if b.text]
+    if static:
+        messages.append({"role": "system", "content": "\n\n".join(static)})
+    messages.extend({"role": t.role, "content": t.content} for t in prompt.history)
+    messages.append({"role": "user", "content": prompt.current_turn})
+    return messages
 
 
 def _is_retryable_status(status: int) -> bool:

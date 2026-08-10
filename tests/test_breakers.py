@@ -298,42 +298,47 @@ def test_new_plan_task_clears_the_previous_task_signature() -> None:
     assert state.signature_streak == 0  # baseline again, not a continuation
 
 
-# ---- signature normalization ----------------------------------------------
+# ---- signature normalization (PRD S12 revised: coarser, exit-code-based) --
 
 
-def test_signature_ignores_test_ordering_and_duplicates() -> None:
-    """Parallel test runners reorder failures; that is noise, not progress."""
-    a = failure_signature(["test_b", "test_a"], "AssertionError", "app/x.py:12")
-    b = failure_signature(["test_a", "test_b", "test_a"], "AssertionError", "app/x.py:12")
+def test_signature_ignores_leading_and_trailing_whitespace() -> None:
+    a = failure_signature("test", 1, "AssertionError: app/x.py:12")
+    b = failure_signature("  test  ", 1, "  AssertionError: app/x.py:12  ")
     assert a == b
 
 
-def test_signature_distinguishes_different_failures() -> None:
-    a = failure_signature(["test_a"], "AssertionError", "app/x.py:12")
-    b = failure_signature(["test_a"], "TypeError", "app/x.py:12")
+def test_signature_distinguishes_different_failed_commands() -> None:
+    a = failure_signature("lint", 1, "F401 unused import")
+    b = failure_signature("test", 1, "F401 unused import")
     assert a != b
 
 
-def test_signature_distinguishes_different_lint_only_failures() -> None:
-    """Regression: before lint_signature/type_signature existed, every
-    lint-only failure hashed identically since the test-shaped fields
-    (failing_test_ids, exception_type, failing_location) are all empty when
-    only the lint gate is red — CB-4 could not tell one lint defect from
-    another."""
-    a = failure_signature([], "", "", lint_signature="E501:cli.py:38")
-    b = failure_signature([], "", "", lint_signature="F401:cli.py:5")
+def test_signature_distinguishes_different_exit_codes() -> None:
+    a = failure_signature("test", 1, "1 failed")
+    b = failure_signature("test", 2, "1 failed")
     assert a != b
 
 
-def test_signature_distinguishes_different_type_only_failures() -> None:
-    a = failure_signature([], "", "", type_signature="arg-type:mod.py:10")
-    b = failure_signature([], "", "", type_signature="assignment:mod.py:22")
+def test_signature_distinguishes_different_output() -> None:
+    a = failure_signature("test", 1, "AssertionError: expected 4 got 5")
+    b = failure_signature("test", 1, "TypeError: unsupported operand")
     assert a != b
 
 
-def test_signature_same_lint_finding_is_the_same_signature() -> None:
-    a = failure_signature([], "", "", lint_signature="E501:cli.py:38")
-    b = failure_signature([], "", "", lint_signature="E501:cli.py:38")
+def test_signature_same_failure_is_the_same_signature() -> None:
+    a = failure_signature("lint", 1, "E501 line too long: cli.py:38")
+    b = failure_signature("lint", 1, "E501 line too long: cli.py:38")
+    assert a == b
+
+
+def test_signature_only_compares_the_output_tail() -> None:
+    """Differing noise ahead of the real finding (e.g. an install step's
+    progress bar) should not dominate the comparison — only the tail matters.
+    The common suffix here is deliberately longer than the tail window, so
+    the differing prefixes fall entirely outside what gets hashed."""
+    common_suffix = "x" * 600 + "\nAssertionError: same finding"
+    a = failure_signature("test", 1, "install noise A " * 50 + common_suffix)
+    b = failure_signature("test", 1, "completely different noise B " * 30 + common_suffix)
     assert a == b
 
 

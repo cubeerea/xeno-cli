@@ -13,6 +13,7 @@ from xeno.graph.prompts import (
     parse_cerberus_output,
     parse_chiron_output,
     parse_daedalus_output,
+    parse_discovery_output,
     parse_odysseus_output,
 )
 
@@ -260,3 +261,42 @@ def test_cerberus_prose_with_no_tags_is_malformed() -> None:
     out = parse_cerberus_output("I think this looks fine overall...")
     assert out.malformed
     assert out.verdict is None
+
+
+def test_discovery_parses_install_and_required_and_advisory() -> None:
+    text = (
+        "<xeno-install>pip install -e .</xeno-install>\n"
+        '<xeno-required-command name="lint">ruff check .</xeno-required-command>\n'
+        '<xeno-required-command name="test">pytest -q</xeno-required-command>\n'
+        '<xeno-advisory-command name="coverage">pytest -q --cov=.</xeno-advisory-command>'
+    )
+    out = parse_discovery_output(text)
+    assert not out.malformed
+    assert out.install == "pip install -e ."
+    assert out.required == (("lint", "ruff check ."), ("test", "pytest -q"))
+    assert out.advisory == (("coverage", "pytest -q --cov=."),)
+
+
+def test_discovery_install_is_optional() -> None:
+    text = '<xeno-required-command name="test">pytest -q</xeno-required-command>'
+    out = parse_discovery_output(text)
+    assert not out.malformed
+    assert out.install is None
+    assert out.required == (("test", "pytest -q"),)
+
+
+def test_discovery_advisory_is_optional() -> None:
+    text = '<xeno-required-command name="test">pytest -q</xeno-required-command>'
+    out = parse_discovery_output(text)
+    assert out.advisory == ()
+
+
+def test_discovery_no_required_commands_is_malformed() -> None:
+    out = parse_discovery_output("<xeno-install>pip install -e .</xeno-install>")
+    assert out.malformed
+    assert out.required == ()
+
+
+def test_discovery_prose_with_no_tags_is_malformed() -> None:
+    out = parse_discovery_output("This repo uses pytest for testing.")
+    assert out.malformed

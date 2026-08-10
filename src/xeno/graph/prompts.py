@@ -190,10 +190,7 @@ def parse_daedalus_output(text: str) -> DaedalusOutput:
     if objection:
         return DaedalusOutput(files=(), objection=objection.group(1).strip())
 
-    files = tuple(
-        FileBlock(path=path.strip(), content=_strip_fence(content))
-        for path, content in _FILE_BLOCK_RE.findall(text)
-    )
+    files = _parse_file_blocks(text)
     if not files:
         return DaedalusOutput(
             files=(),
@@ -210,6 +207,16 @@ def parse_daedalus_output(text: str) -> DaedalusOutput:
 def _strip_fence(content: str) -> str:
     match = _FENCE_RE.match(content.strip())
     return match.group(1) if match else content
+
+
+def _parse_file_blocks(text: str) -> tuple[FileBlock, ...]:
+    """Daedalus and Chiron share one wire format for writes, so they share
+    this — the two nodes differ in what an EMPTY result means (a blocking
+    objection vs. a decline), never in how a non-empty one is read."""
+    return tuple(
+        FileBlock(path=path.strip(), content=_strip_fence(content))
+        for path, content in _FILE_BLOCK_RE.findall(text)
+    )
 
 
 _DECLINE_RE = re.compile(r"<xeno-decline>(.*?)</xeno-decline>", re.DOTALL)
@@ -244,10 +251,7 @@ def parse_chiron_output(text: str) -> ChironOutput:
     if decline:
         return ChironOutput(files=(), declined=True, decline_reason=decline.group(1).strip())
 
-    files = tuple(
-        FileBlock(path=path.strip(), content=_strip_fence(content))
-        for path, content in _FILE_BLOCK_RE.findall(text)
-    )
+    files = _parse_file_blocks(text)
     if not files:
         return ChironOutput(
             files=(),
@@ -416,7 +420,7 @@ ARGUS_SYSTEM = """\
 You are Argus, the researcher node in the Xeno CLI harness (PRD S10). You
 have no shell access and never write or evaluate code — you only look at a
 repository's file tree and report back. Each instruction below tells you
-which of your two jobs this call is; do exactly the one it asks for.
+which of your three jobs this call is; do exactly the one it asks for.
 
 JOB 1 - REPO SKELETON: given a file tree, write a short, plain-prose
 summary of its structure: what the main components are, where source vs.
@@ -444,6 +448,43 @@ Rules for JOB 2:
   in the given file tree — never invent a path.
 - Name only files that genuinely matter; a long list defeats the point of
   having a research step at all.
+
+JOB 3 - TOOLCHAIN DISCOVERY: given a file tree and the contents of any
+manifest/build files present (package.json, pyproject.toml, Cargo.toml, go.mod,
+Makefile, etc.), propose the fixed commands needed to install dependencies,
+lint, type-check, and test this repository. THE GATES THAT RUN THESE COMMANDS
+ARE DETERMINISTIC — your job is only to name which commands to run, never to
+judge whether code passes or fails. This is a one-time call, cached and reused
+for every future run against this repository until its manifests change.
+Respond with:
+
+<xeno-install>the one command to install this repo's declared dependencies</xeno-install>
+
+<xeno-required-command name="short label, e.g. lint">the command, e.g. ruff check .
+</xeno-required-command>
+
+(one <xeno-required-command> tag per required check — install, lint,
+type-check, test, build, whatever this repository's toolchain actually has;
+omit any that do not apply)
+
+<xeno-advisory-command name="short label, e.g. coverage">the command</xeno-advisory-command>
+
+(zero or more — for checks that should run and be visible in the log but
+must never block a passing result, e.g. coverage)
+
+Rules for JOB 3:
+- Every command is ONE fixed argv, not a shell script: no `&&`, no `|`, no
+  `;`, no `>`, no environment-variable substitution. If a repository needs
+  more than one step, emit more than one <xeno-required-command> tag rather
+  than chaining them.
+- `<xeno-install>` is optional — omit it entirely if the repository declares
+  no dependencies to install.
+- At least one <xeno-required-command> is mandatory: a discovery response
+  with nothing required to run cannot be used to evaluate any change.
+- Only propose commands for a toolchain that is genuinely evidenced by the
+  files you were shown (a `package.json` with a `test` script, a
+  `pyproject.toml` naming pytest, etc.) — never guess a toolchain that is not
+  actually present.
 """
 
 #: Selects JOB 1 for a call — sent once per run, before Odysseus's first
@@ -452,6 +493,10 @@ ARGUS_SKELETON_PREFIX = "JOB 1 - REPO SKELETON. Repository file tree:"
 
 #: Selects JOB 2 for a call — sent on every per-task research call.
 ARGUS_RESEARCH_PREFIX = "JOB 2 - FILE RESEARCH."
+
+#: Selects JOB 3 for a call — sent once per repository, cached thereafter
+#: (`xeno.adapters.discovery`), never once per run.
+DISCOVERY_PREFIX = "JOB 3 - TOOLCHAIN DISCOVERY."
 
 #: Sent only on L2 re-research (PRD S7.2): a patch already failed against
 #: the files Argus found the first time, so this call is specifically
@@ -513,6 +558,75 @@ def parse_argus_research_output(text: str) -> ArgusResearchOutput:
         ),
         malformed=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Toolchain discovery (PRD S8.2, S12 revised): Argus's JOB 3.
+#
+# Deliberately NOT a new NodeRole/system prompt: `PromptBuilder` fingerprints
+# one system text per `NodeRole` for the life of the process (PRD T8) and
+# raises if it ever sees a second one — so discovery reuses `ARGUS_SYSTEM`
+# byte-for-byte and only the current-turn prefix below picks JOB 3, exactly
+# like `ARGUS_SKELETON_PREFIX`/`ARGUS_RESEARCH_PREFIX` already do for jobs 1
+# and 2. The gates this feeds stay deterministic tools (PRD S8.2) — this call
+# only ever proposes WHICH commands to run, never a pass/fail verdict.
+# ---------------------------------------------------------------------------
+
+DISCOVERY_FORMAT_CORRECTION = """\
+Your previous response did not use the required format — no valid
+<xeno-required-command> tag was found. Resend your answer using ONLY the tag
+format from JOB 3 in the system prompt: no explanation, no markdown code
+fences, just the tag(s) and their content. Remember each command is one fixed
+argv, never a shell script — no `&&`, `|`, `;`, or `>`.
+"""
+
+_INSTALL_RE = re.compile(r"<xeno-install>\n?(.*?)\n?</xeno-install>", re.DOTALL)
+_REQUIRED_COMMAND_RE = re.compile(
+    r'<xeno-required-command\s+name=["\']([^"\']+)["\']\s*>\n?(.*?)\n?</xeno-required-command>',
+    re.DOTALL,
+)
+_ADVISORY_COMMAND_RE = re.compile(
+    r'<xeno-advisory-command\s+name=["\']([^"\']+)["\']\s*>\n?(.*?)\n?</xeno-advisory-command>',
+    re.DOTALL,
+)
+
+
+def _named_commands(pattern: re.Pattern[str], text: str) -> tuple[tuple[str, str], ...]:
+    """Required and advisory commands differ only in which tag carries them
+    and in what a failure means downstream — the extraction is the same."""
+    return tuple((name.strip(), argv.strip()) for name, argv in pattern.findall(text))
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryOutput:
+    """Raw wire-format extraction only — tokenizing each command's text into
+    an argv and validating it against the executable allowlist both happen in
+    `xeno.adapters.discovery`, which owns that safety boundary."""
+
+    install: str | None
+    required: tuple[tuple[str, str], ...]
+    advisory: tuple[tuple[str, str], ...]
+    malformed: bool = False
+
+
+def parse_discovery_output(text: str) -> DiscoveryOutput:
+    """Parse a JOB 3 response into an install command plus required/advisory
+    command lists.
+
+    At least one required command is mandatory — a discovery response with
+    nothing to run cannot gate anything, so an empty `required` list is
+    itself treated as malformed, same shape as every other node's "nothing
+    safe to act on" fallback.
+    """
+    install_match = _INSTALL_RE.search(text)
+    install = install_match.group(1).strip() if install_match else None
+
+    required = _named_commands(_REQUIRED_COMMAND_RE, text)
+    if not required:
+        return DiscoveryOutput(install=None, required=(), advisory=(), malformed=True)
+
+    advisory = _named_commands(_ADVISORY_COMMAND_RE, text)
+    return DiscoveryOutput(install=install, required=required, advisory=advisory)
 
 
 # ---------------------------------------------------------------------------

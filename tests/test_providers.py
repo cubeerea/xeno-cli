@@ -112,9 +112,9 @@ def test_ollama_keeps_the_model_resident() -> None:
     this tier exists to keep low."""
     provider = OllamaProvider("ollama", OLLAMA)
     captured: dict[str, object] = {}
-    def fake_post(path: str, payload: dict[str, object]) -> dict[str, object]:
+    def fake_post(path: str, payload: dict[str, object]) -> tuple[dict[str, object], float]:
         captured.update(payload)
-        return {"message": {"content": "x"}}
+        return {"message": {"content": "x"}}, 1.0
 
     provider._post = fake_post  # type: ignore[method-assign]
     provider.complete(
@@ -240,3 +240,14 @@ def test_uncached_equivalent_ignores_the_discount() -> None:
     assert uncached_price(usage, PRICED, OPENROUTER) == pytest.approx(
         1000 * 1.40 / 1_000_000 + 100 * 2.20 / 1_000_000
     )
+
+
+def test_prefix_cache_support_defaults_to_false_so_the_warning_can_fire() -> None:
+    """PRD S9.6.3's local-backend warning was previously unreachable: the
+    capability was duck-typed and its one implementation returned a literal
+    True. Defaulting to False on the base class means a new local provider
+    trips the warning unless it explicitly claims the capability."""
+    from xeno.router.providers.base import Provider
+
+    assert Provider.supports_prefix_cache(object()) is False  # type: ignore[arg-type]
+    assert OllamaProvider("ollama", OLLAMA).supports_prefix_cache() is True

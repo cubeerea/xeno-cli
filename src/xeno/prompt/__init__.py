@@ -13,7 +13,7 @@ from xeno.prompt.assembly import (
     PromptBuilder,
     Turn,
 )
-from xeno.prompt.delimit import as_data, harness_summary
+from xeno.prompt.delimit import as_data
 from xeno.prompt.keys import CacheKeyring, StaleCodebaseMapError
 
 __all__ = [
@@ -26,5 +26,4 @@ __all__ = [
     "StaleCodebaseMapError",
     "Turn",
     "as_data",
-    "harness_summary",
 ]

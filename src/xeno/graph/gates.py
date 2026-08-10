@@ -1,181 +1,99 @@
-"""Talos's deterministic quality gates (PRD S10): parse, lint, type, test,
-coverage.
+"""Talos's deterministic quality gates (PRD S10, S8.2 revised): run a
+discovered command list, decide pass/fail purely on exit code.
 
 "THE GATES ARE DETERMINISTIC TOOLS, not model calls" (PRD S8.2) — nothing in
-this module calls an LLM. Every gate runs via a fixed argv list built by a
-`LanguageAdapter` (PRD S12), executed inside a `Sandbox` acquired from the
-warm pool (PRD S11, S13 Phase 2) — never on the host. Phase 1's host
-subprocess version of this module is gone; the Phase 2 exit criterion is
-"zero host execution of generated code."
+this module calls an LLM. The commands themselves come from a
+`DiscoveredToolchain` (`xeno.adapters.discovery`, a model call made once per
+repo and cached), but by the time this module runs, that decision is already
+frozen into a fixed argv list — the same "fixed argument vector, never a
+shell string" contract every gate has always had. Every command executes
+inside a `Sandbox` acquired from the warm pool (PRD S11, S13 Phase 2) — never
+on the host.
 
-Lint and type checks are scoped to the files Daedalus/Chiron touched (the
-diff is what changed); the test suite runs over the whole worktree, because a
-single-file change can break tests elsewhere and "tests_must_still_pass" is
-part of the suite's own acceptance criteria (XENO-SUITE-30). Coverage only
-runs on an otherwise-green result — it is advisory (PRD S10 gate 5) and
-doubling test runtime to measure coverage of a suite that is still red buys
-nothing.
+`toolchain.required` runs in declared order, fail-fast: there is nothing for
+a later command to say once an earlier one has failed, and not every
+ecosystem separates parse/lint/type/test into distinct commands the way the
+old Python-only gate chain assumed. `toolchain.advisory` runs only once every
+required command has passed, and never flips the verdict — the same
+"advisory, non-blocking" contract PRD S10 gate 5 (coverage) always had,
+generalized to any advisory command instead of one hardcoded coverage step.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import Protocol
 
-from xeno.adapters.base import LanguageAdapter, TestSummary
-from xeno.sandbox.pool import Sandbox
+from xeno.adapters.generic import DiscoveredCommand, DiscoveredToolchain
 
-#: Generous but bounded — an evaluation that never returns is worse than one
-#: that fails fast and lets CB-1 do its job.
-GATE_TIMEOUT_SECONDS = 120
-TEST_TIMEOUT_SECONDS = 300
+#: Generous but bounded — a command that never returns is worse than one
+#: that fails fast and lets CB-1 do its job. One budget for every discovered
+#: command: which of them is "the test one" is no longer something this
+#: module knows (PRD S12 revised), so the ceiling is set by the slowest thing
+#: a repo might plausibly gate on.
+COMMAND_TIMEOUT_SECONDS = 300
+
+#: `Sandbox.exec`'s out-of-band signal that the command never returned, as
+#: opposed to returning a real non-zero status (`xeno.sandbox.pool`). Kept
+#: distinct from a code defect all the way into `EvalReport.
+#: infrastructure_failure`, because the escalation ladder must not send
+#: Chiron chasing a bug that isn't there (PRD S10).
+_INFRASTRUCTURE_EXIT = -1
+
+
+class _Execable(Protocol):
+    """The one method this module actually needs from `xeno.sandbox.pool.
+    Sandbox` — a `Protocol` rather than the concrete class so a test fake can
+    satisfy it structurally instead of standing up a real Docker container."""
+
+    def exec(self, argv: Sequence[str], *, timeout: float) -> tuple[int, str]: ...
 
 
 @dataclass(frozen=True, slots=True)
 class GateOutcome:
-    parse_ok: bool
-    lint_errors: int
-    type_errors: int
-    tests_run: int
-    tests_failed: int
-    failing_test_ids: tuple[str, ...]
-    exception_type: str
-    failing_location: str
+    passed: bool
+    #: Name of the first required command that failed, or "" when `passed`
+    #: is True or the failure was infrastructure (nothing code-shaped to
+    #: name).
+    failed_command: str
+    exit_code: int | None
     infrastructure_failure: bool
-    #: PRD S10 gate 5. None when the gate did not run (a failing gate chain,
-    #: or an adapter with no coverage tool).
-    coverage_percent: float | None = None
     log: str = field(default="", repr=False)
-    #: Identity of the lint/type findings (rule codes + locations), not just
-    #: their count — CB-4's `failure_signature` (PRD S7.3) needs this because
-    #: `exception_type`/`failing_location` above are test-shaped and stay
-    #: empty for a lint- or type-only failure. Empty string when the
-    #: respective gate found nothing to report.
-    lint_signature: str = ""
-    type_signature: str = ""
 
 
-def run_gates(
-    sandbox: Sandbox,
-    adapter: LanguageAdapter,
-    worktree: Path,
-    touched_files: Sequence[Path],
-) -> GateOutcome:
-    """Run the gate chain in order, fail-fast on parse (PRD S10 gate order).
+def run_gates(sandbox: _Execable, toolchain: DiscoveredToolchain) -> GateOutcome:
+    """Run `toolchain.required` in order (fail-fast), then `toolchain.
+    advisory` best-effort if every required command passed."""
+    log_chunks: list[str] = []
 
-    A parse failure short-circuits everything after it: there is nothing for
-    a linter or type checker to say about a file that does not parse, and
-    running pytest against a broken worktree would just report collection
-    errors that duplicate the same information less precisely.
-    """
-    py_files = [p.relative_to(worktree).as_posix() for p in touched_files if p.suffix == ".py"]
+    def run(command: DiscoveredCommand, label: str) -> int:
+        exit_code, output = sandbox.exec(command.argv, timeout=COMMAND_TIMEOUT_SECONDS)
+        log_chunks.append(f"---- {label} ----\n{output}")
+        return exit_code
 
-    parse_ok, parse_log, parse_infra = _parse_gate(sandbox, adapter, py_files)
-    if not parse_ok:
-        return GateOutcome(
-            parse_ok=False,
-            lint_errors=0,
-            type_errors=0,
-            tests_run=0,
-            tests_failed=0,
-            failing_test_ids=(),
-            exception_type="" if parse_infra else "SyntaxError",
-            failing_location=parse_log,
-            infrastructure_failure=parse_infra,
-            log=parse_log,
-        )
+    for command in toolchain.required:
+        exit_code = run(command, command.name)
+        if exit_code != 0:
+            infrastructure = exit_code == _INFRASTRUCTURE_EXIT
+            return GateOutcome(
+                passed=False,
+                failed_command=command.name,
+                exit_code=None if infrastructure else exit_code,
+                infrastructure_failure=infrastructure,
+                log="\n".join(log_chunks),
+            )
 
-    lint_errors, lint_signature, lint_log, lint_infra = _lint_gate(sandbox, adapter, py_files)
-    type_errors, type_signature, type_log, type_infra = _type_gate(sandbox, adapter, py_files)
-    summary, test_log, test_infra = _test_gate(sandbox, adapter)
-
-    infra = lint_infra or type_infra or test_infra
-    log = "\n---- lint ----\n" + lint_log + "\n---- types ----\n" + type_log
-    log += "\n---- tests ----\n" + test_log
-
-    exc_type = summary.exception_type
-    location = summary.failing_location
-    if not exc_type and (lint_errors or type_errors):
-        exc_type = "LintOrTypeError"
-        location = f"{lint_errors} lint, {type_errors} type error(s)"
-
-    coverage_percent: float | None = None
-    green = not infra and lint_errors == 0 and type_errors == 0 and summary.tests_failed == 0
-    if green:
-        coverage_percent, cov_log = _coverage_gate(sandbox, adapter)
-        log += "\n---- coverage ----\n" + cov_log
+    for command in toolchain.advisory:
+        # Best-effort and genuinely non-blocking (PRD S10 gate 5): a timeout
+        # or a crash here must never turn a green required chain red, so the
+        # exit code is logged and discarded rather than inspected.
+        run(command, f"{command.name} (advisory)")
 
     return GateOutcome(
-        parse_ok=True,
-        lint_errors=lint_errors,
-        type_errors=type_errors,
-        tests_run=summary.tests_run,
-        tests_failed=summary.tests_failed,
-        failing_test_ids=summary.failing_test_ids,
-        exception_type=exc_type,
-        failing_location=location,
-        infrastructure_failure=infra,
-        coverage_percent=coverage_percent,
-        log=log,
-        lint_signature=lint_signature,
-        type_signature=type_signature,
+        passed=True,
+        failed_command="",
+        exit_code=0,
+        infrastructure_failure=False,
+        log="\n".join(log_chunks),
     )
-
-
-def _parse_gate(
-    sandbox: Sandbox, adapter: LanguageAdapter, py_files: list[str]
-) -> tuple[bool, str, bool]:
-    cmd = adapter.parse_cmd(py_files)
-    if cmd is None:
-        return True, "", False
-    code, output = sandbox.exec(cmd, timeout=GATE_TIMEOUT_SECONDS)
-    if code == -1:
-        return False, output, True
-    return code == 0, output, False
-
-
-def _lint_gate(
-    sandbox: Sandbox, adapter: LanguageAdapter, py_files: list[str]
-) -> tuple[int, str, str, bool]:
-    if not py_files:
-        return 0, "", "", False
-    code, output = sandbox.exec(adapter.lint_cmd(py_files), timeout=GATE_TIMEOUT_SECONDS)
-    if code == -1:
-        return 0, "", output, True
-    try:
-        return adapter.parse_lint(output), adapter.lint_signature(output), output, False
-    except ValueError:
-        # The adapter got output it could not make sense of — an adapter
-        # fault, not a lint finding attributable to the code under test.
-        return 0, "", output, True
-
-
-def _type_gate(
-    sandbox: Sandbox, adapter: LanguageAdapter, py_files: list[str]
-) -> tuple[int, str, str, bool]:
-    if not py_files:
-        return 0, "", "", False
-    code, output = sandbox.exec(adapter.typecheck_cmd(py_files), timeout=GATE_TIMEOUT_SECONDS)
-    if code == -1:
-        return 0, "", output, True
-    return adapter.parse_typecheck(output), adapter.type_signature(output), output, False
-
-
-def _test_gate(sandbox: Sandbox, adapter: LanguageAdapter) -> tuple[TestSummary, str, bool]:
-    code, output = sandbox.exec(adapter.test_cmd(), timeout=TEST_TIMEOUT_SECONDS)
-    if code == -1:
-        return TestSummary(0, 0, (), "", ""), output, True
-    return adapter.parse_test_failures(output), output, False
-
-
-def _coverage_gate(sandbox: Sandbox, adapter: LanguageAdapter) -> tuple[float | None, str]:
-    cmd = adapter.coverage_cmd()
-    if cmd is None:
-        return None, ""
-    # Best-effort and genuinely non-blocking (PRD S10 gate 5): a timeout or a
-    # coverage-tool crash here must never turn a green gate chain red.
-    code, output = sandbox.exec(cmd, timeout=TEST_TIMEOUT_SECONDS)
-    if code == -1:
-        return None, output
-    return adapter.parse_coverage(output), output

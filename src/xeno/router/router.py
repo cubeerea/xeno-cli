@@ -55,7 +55,6 @@ class ChainExhaustedError(Exception):
             + ". Downward fallback is forbidden, so the run halts here."
         )
         self.tier = tier
-        self.attempts = attempts
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +62,6 @@ class RouterResult:
     text: str
     record: CallRecord
     model: ModelSpec
-    provider_name: str
     escalated: bool
 
 
@@ -146,9 +144,7 @@ class Router:
         for name, spec in self.config.providers.items():
             if not spec.is_local:
                 continue
-            provider = self.provider(name)
-            supports = getattr(provider, "supports_prefix_cache", None)
-            if supports is not None and not supports():
+            if not self.provider(name).supports_prefix_cache():
                 warnings.append(
                     f"local backend '{name}' has no prefix-cache reuse; repeated "
                     f"Daedalus/Chiron/Talos calls will re-process the whole prefix"
@@ -312,7 +308,6 @@ class Router:
                 text=result.text,
                 record=record,
                 model=entry,
-                provider_name=entry.provider,
                 escalated=escalated,
             )
 

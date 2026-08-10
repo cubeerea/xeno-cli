@@ -3,7 +3,7 @@ git layer (PRD S8.4, S13 Phase 4): branch naming, squashing, and optional PR
 creation on top of it.
 
 Every call is a fixed argument vector, never a shell string — the same rule
-`LanguageAdapter` follows for the same reason (PRD T3): nothing here is
+the adapter layer follows for the same reason (PRD T3): nothing here is
 built from model-authored text. `open_pr`'s title/body ARE model-authored
 (Cerberus's commit message), but that is not the same hazard: passing them
 as argv elements to `subprocess.run` with `shell=False` never invokes a

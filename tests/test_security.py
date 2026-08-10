@@ -5,7 +5,11 @@ from __future__ import annotations
 from xeno.core.types import Breakpoint, NodeRole
 from xeno.prompt.assembly import PromptBuilder
 from xeno.security.outbound import sanitize
-from xeno.security.scanner import SecretScanner, shannon_entropy
+from xeno.security.scanner import (
+    _SCAN_CACHE_ENTRIES,
+    SecretScanner,
+    shannon_entropy,
+)
 
 scanner = SecretScanner()
 
@@ -136,3 +140,27 @@ def test_clean_prompt_passes_through_unchanged(keyring) -> None:  # type: ignore
     sanitized = sanitize(prompt, scanner)
     assert sanitized.clean
     assert sanitized.prompt.current_turn == prompt.current_turn
+
+
+def test_repeated_scans_are_memoized_without_changing_the_result() -> None:
+    """`sanitize` re-scans every static block and every accumulated history
+    turn on every model call, and those are byte-identical call after call —
+    so `scan` memoizes. Redaction must stay deterministic through the cache
+    (PRD T8: a drifting SYSTEM or CODEBASE MAP loses its cache hits)."""
+    text = "AWS_SECRET=" + "A" * 40 + " and sk-ant-api03-" + "k" * 40
+    fresh = SecretScanner(entropy_threshold=4.0)
+
+    first = fresh.scan(text)
+    second = fresh.scan(text)
+
+    assert second is first  # served from the memo, not rescanned
+    assert second.text == SecretScanner(entropy_threshold=4.0).scan(text).text
+
+
+def test_the_scan_memo_is_bounded() -> None:
+    """The entries are prompt-sized strings, so the cache is a memory ceiling
+    as much as a speed-up — it must not grow with the length of a run."""
+    bounded = SecretScanner()
+    for i in range(_SCAN_CACHE_ENTRIES * 3):
+        bounded.scan(f"harmless text number {i}")
+    assert len(bounded._cache) <= _SCAN_CACHE_ENTRIES

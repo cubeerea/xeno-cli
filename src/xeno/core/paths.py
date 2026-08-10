@@ -5,7 +5,6 @@
         events.jsonl     append-only, replayable run log
         cost.json        the per-run cost ledger (M1.1-M1.4 instrument)
         workspace/       filesystem-as-memory: handle targets
-        index/           Argus's per-run symbol table
       worktrees/<run_id>/  isolated git worktree for the run
 """
 
@@ -37,6 +36,19 @@ def slugify(goal: str, *, max_len: int = 32) -> str:
     return (slug[:max_len].rstrip("-")) or "run"
 
 
+def run_branch_name(prefix: str, goal: str, run_id: str) -> str:
+    """The dedicated branch a run lives on (PRD S8.4).
+
+    Lives here because two modules need to agree on it exactly and neither
+    can ask the other: `xeno.graph.build` CREATES the branch at the start of
+    a run, and `xeno.cli` NAMES it again afterwards to report and push it.
+    It is a pure function of inputs both already hold, so recomputing beats
+    threading it back through the graph's return value — but only as long as
+    there is one formula rather than two copies that can drift.
+    """
+    return f"{prefix}{slugify(goal)}-{short_run_id(run_id)}"
+
+
 @dataclass(frozen=True, slots=True)
 class RunPaths:
     repo_root: Path
@@ -63,14 +75,10 @@ class RunPaths:
         return self.run_dir / "workspace"
 
     @property
-    def index(self) -> Path:
-        return self.run_dir / "index"
-
-    @property
     def worktree(self) -> Path:
         return self.state / "worktrees" / self.run_id
 
     def ensure(self) -> RunPaths:
-        for directory in (self.run_dir, self.workspace, self.index):
+        for directory in (self.run_dir, self.workspace):
             directory.mkdir(parents=True, exist_ok=True)
         return self
