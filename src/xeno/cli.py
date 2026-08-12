@@ -1,6 +1,6 @@
 """The `xeno` command (PRD S13).
 
-`xeno run` drives the full six-node graph (PRD S13 Phase 3-4): Odysseus
+`xeno run` drives the full seven-node graph (PRD S13 Phase 3-4): Odysseus
 plans the goal into tasks, Argus researches each one, Daedalus implements
 it, Talos's sandboxed gates evaluate it, a bounded L0-L5 escalation ladder
 (re-run, patch, re-research, roll back and rewrite, re-plan, halt) handles
@@ -21,16 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-import docker
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from xeno import __version__
 from xeno.adapters.discovery import DiscoveryError, discover_toolchain
-from xeno.adapters.generic import GenericAdapter
 from xeno.core import vcs
 from xeno.core.config import (
     CONFIG_FILENAME,
@@ -43,19 +41,20 @@ from xeno.core.paths import RunPaths, new_run_id, run_branch_name
 from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import CALLSIGNS, NodeRole, Tier, Verdict
-from xeno.graph import run_graph
+from xeno.graph.build import run_graph
+from xeno.graph.spec import SpecAbandoned, run_spec_conversation, spec_chain_error
+from xeno.graph.toolchain import ToolchainSession
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.providers import UnsupportedProviderError
 from xeno.router.router import ChainExhaustedError, Router
-from xeno.sandbox.pool import WarmPool, prepare_gate_image
 from xeno.security.mounts import mount_ignore
 from xeno.security.scanner import SecretScanner
+from xeno.ui.live import LiveRunView, NullRunView, RunView
 
 app = typer.Typer(
     name="xeno",
     help="Terminal-native multi-agent coding harness. One human gate, tier-routed models.",
-    no_args_is_help=True,
     add_completion=False,
 )
 models_app = typer.Typer(name="models", help="Inspect and exercise configured model tiers.")
@@ -148,6 +147,7 @@ def _start_run(
     state_goal: str,
     succeeded: Callable[[], bool],
     keyring_on_worktree: bool = False,
+    observer: Callable[[dict[str, Any]], None] | None = None,
     **event_fields: Any,
 ) -> tuple[_RunContext, RunLog]:
     """Open a run's log, ledger, router, and state, registering teardown on
@@ -169,7 +169,7 @@ def _start_run(
     ledger = CostLedger(run_id=run_id, caching_enabled=config.caching.enabled)
     scanner = SecretScanner(entropy_threshold=config.secrets.entropy_threshold)
 
-    runlog = stack.enter_context(RunLog(paths.events, run_id=run_id))
+    runlog = stack.enter_context(RunLog(paths.events, run_id=run_id, observer=observer))
     runlog.event(
         EventKind.RUN_START,
         xeno_version=__version__,
@@ -199,13 +199,52 @@ def _start_run(
 
 @app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: Annotated[
         bool, typer.Option("--version", help="Print the version and exit.")
     ] = False,
+    config_path: ConfigOption = None,
+    repo: Annotated[
+        Path, typer.Option("--repo", help="Repository to work in.")
+    ] = Path("."),
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Suppress the live graph and narration.")
+    ] = False,
 ) -> None:
+    """Bare `xeno` opens a spec conversation, then builds what you agreed.
+
+    `xeno run "<goal>"` remains the non-interactive form for when the goal
+    is already settled and for scripting.
+    """
     if version:
         console.print(f"xeno-cli {__version__}")
         raise typer.Exit()
+    if ctx.invoked_subcommand is not None:
+        return
+    if not console.is_terminal:
+        _error("`xeno` with no arguments needs a terminal — use `xeno run \"<goal>\"` instead.")
+        raise typer.Exit(code=2)
+    _interactive(config_path, repo=repo, quiet=quiet)
+
+
+def _interactive(config_path: Path | None, *, repo: Path, quiet: bool) -> None:
+    """The `xeno`-with-no-arguments session."""
+    config = _resolve_config(config_path)
+    console.print(Panel(_SPEC_BANNER.strip(), border_style="cyan"))
+    try:
+        idea = Prompt.ask("\n[bold cyan]what are we building[/]").strip()
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]nothing to do.[/]")
+        raise typer.Exit(code=1) from None
+    if not idea:
+        console.print("[dim]nothing to do.[/]")
+        raise typer.Exit(code=1)
+
+    try:
+        _execute(config, goal=idea, repo=repo, quiet=quiet, context_files=None, idea=idea)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]interrupted — nothing was squashed or pushed.[/]")
+        raise typer.Exit(code=130) from None
 
 
 @app.command()
@@ -421,6 +460,16 @@ def run(
     repo: Annotated[
         Path, typer.Option("--repo", help="Source repository copied into a throwaway worktree.")
     ] = Path("."),
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            help="Suppress the live graph and per-node narration. Implied when "
+            "stdout is not a terminal, so piping or redirecting a run always "
+            "produces a clean transcript.",
+        ),
+    ] = False,
     context_files: Annotated[
         list[str] | None,
         typer.Option(
@@ -431,7 +480,7 @@ def run(
         ),
     ] = None,
 ) -> None:
-    """Plan and execute `goal` with the full six-node graph (PRD S13 Phase 3-4).
+    """Plan and execute `goal` with the full seven-node graph (PRD S13 Phase 3-4).
 
     Odysseus breaks the goal into a plan of tasks; each task is researched by
     Argus, implemented by Daedalus, and evaluated by Talos's sandboxed gates
@@ -444,11 +493,38 @@ def run(
     written objections. Operates on a throwaway copy of `repo` under
     .xeno/worktrees/<run_id>, never the user's working tree.
     """
-    config = _resolve_config(config_path)
+    _execute(
+        _resolve_config(config_path),
+        goal=goal,
+        repo=repo,
+        quiet=quiet,
+        context_files=context_files,
+        idea=None,
+    )
+
+
+def _execute(
+    config: XenoConfig,
+    *,
+    goal: str,
+    repo: Path,
+    quiet: bool,
+    context_files: list[str] | None,
+    idea: str | None,
+) -> None:
+    """One run, shared by `xeno run` and the interactive session.
+
+    `idea` selects the interactive front half: when set, Odysseus JOB 2
+    converses to a written spec first and its title replaces `goal`. Both
+    halves live in ONE run context on purpose — the conversation's tokens
+    are part of what the run cost, and splitting them across two ledgers
+    would understate every figure the harness reports about itself.
+    """
     _preflight(config)
 
     repo_root = repo.resolve()
     final_state: AgentState | None = None
+    view = _make_view(quiet)
 
     with ExitStack() as stack:
         ctx, runlog = _start_run(
@@ -458,11 +534,15 @@ def run(
             state_goal=goal,
             succeeded=lambda: bool(final_state and final_state.review_verdict is Verdict.APPROVE),
             keyring_on_worktree=True,
+            observer=view.handle,
             command="run",
             goal=goal,
         )
         worktree = ctx.paths.worktree
         _copy_into_worktree(repo_root, worktree, config)
+
+        if idea is not None:
+            goal = _converse_to_spec(ctx, config, idea)
 
         # PRD S9.6.3: without this, `provider.cache_capable` stays None for
         # the whole run, `supports_explicit_cache_markers()` is False for
@@ -487,29 +567,55 @@ def run(
                 config=config,
                 keyring=ctx.keyring,
                 state=ctx.state,
+                paths=ctx.paths,
                 repo_root=repo_root,
                 worktree=worktree,
+                # Greenfield is a supported starting point, not a usage
+                # error: a repo with no manifest resolves to an
+                # unestablished toolchain and the run's first task is to
+                # scaffold one (`xeno.graph.toolchain`). A repo that DOES
+                # declare a toolchain we then fail to read still raises.
+                allow_unestablished=True,
             )
         except DiscoveryError as exc:
             _error(f"toolchain discovery failed: {exc}")
             raise typer.Exit(code=2) from exc
 
-        adapter = GenericAdapter(toolchain)
-        pool = _build_pool(stack, adapter, config, paths=ctx.paths, worktree=worktree)
-        _seed_context_files(ctx.state, worktree, context_files)
+        if not toolchain.established:
+            _warn(
+                "no manifest found — treating this as a new project. The first planned "
+                "task will scaffold the toolchain (manifest, lint/type/test config); "
+                "gates start running once it exists."
+            )
 
-        final_state = run_graph(
+        session = ToolchainSession(
             router=ctx.router,
             config=config,
             keyring=ctx.keyring,
             paths=ctx.paths,
+            repo_root=repo_root,
             worktree=worktree,
             runlog=runlog,
-            state=ctx.state,
-            pool=pool,
-            adapter=adapter,
-            repo_root=repo_root,
+            toolchain=toolchain,
         )
+        session.start(stack)
+        _seed_context_files(ctx.state, worktree, context_files)
+
+        # The live view is only pinned around the graph itself: warnings and
+        # preflight output above it are ordinary scrollback, and the human
+        # gate below it needs the terminal back to prompt.
+        with view.running():
+            final_state = run_graph(
+                router=ctx.router,
+                config=config,
+                keyring=ctx.keyring,
+                paths=ctx.paths,
+                worktree=worktree,
+                runlog=runlog,
+                state=ctx.state,
+                session=session,
+                repo_root=repo_root,
+            )
 
     assert final_state is not None
     _print_run_summary(final_state, worktree)
@@ -517,6 +623,76 @@ def run(
 
     branch = run_branch_name(config.git.branch_prefix, goal, ctx.run_id)
     raise typer.Exit(code=_finalize(final_state, config, worktree, branch))
+
+
+_SPEC_BANNER = """\
+[bold]xeno[/] — describe what you want to build.
+
+Odysseus will ask about anything it cannot reasonably assume, then write a
+spec and hand it to the seven-node graph. Say 'go' at any point to build with
+the assumptions so far, or press Ctrl-C to leave.
+"""
+
+
+def _converse_to_spec(ctx: _RunContext, config: XenoConfig, idea: str) -> str:
+    """Run Odysseus JOB 2 to a written spec and make it this run's goal.
+
+    The spec body is seeded as a context Handle rather than assigned to
+    `state.goal`: `AgentState` fields are capped at 4 KB (PRD S6.3) and a
+    real spec exceeds that, so the goal carries the one-line title and every
+    node reads the full text through the same context mechanism it already
+    uses for source files.
+    """
+
+    def show(text: str) -> None:
+        console.print()
+        console.print(Panel(text, title="odysseus", border_style="cyan", title_align="left"))
+
+    try:
+        spec = run_spec_conversation(
+            router=ctx.router,
+            config=config,
+            keyring=ctx.keyring,
+            state=ctx.state,
+            paths=ctx.paths,
+            idea=idea,
+            ask=lambda label: Prompt.ask(f"\n[bold cyan]{label}[/]"),
+            show=show,
+        )
+    except SpecAbandoned as exc:
+        _error(f"no spec was produced: {exc}")
+        raise typer.Exit(code=1) from exc
+    except ChainExhaustedError as exc:
+        _error(spec_chain_error(exc))
+        raise typer.Exit(code=2) from exc
+
+    spec_path = spec.write(ctx.paths.workspace)
+    ctx.state.goal = spec.title
+    ctx.state.context_handles = [
+        *ctx.state.context_handles,
+        Handle.for_file(spec_path, summary=f"spec: {spec.title}"),
+    ]
+
+    console.print()
+    console.print(Panel(spec.body, title=spec.title, border_style="green", title_align="left"))
+    console.print(f"[dim]spec written to {spec_path}[/]")
+    if not Confirm.ask("\nBuild this?", default=True):
+        console.print("[yellow]stopped — nothing was built.[/]")
+        raise typer.Exit(code=1)
+    return spec.title
+
+
+def _make_view(quiet: bool) -> RunView:
+    """The live view, or a no-op stand-in.
+
+    Not a terminal means not a view, regardless of `--quiet`: a run whose
+    output is being piped, redirected, or captured by CI should produce a
+    plain transcript, and a `Live` region redrawing into a file produces
+    neither a usable log nor a usable picture.
+    """
+    if quiet or not console.is_terminal:
+        return NullRunView()
+    return LiveRunView(console)
 
 
 def _preflight(config: XenoConfig) -> None:
@@ -543,41 +719,6 @@ def _preflight(config: XenoConfig) -> None:
             "skipped at the end of this run; the squashed commit will still land on "
             "the preserved local branch."
         )
-
-
-def _build_pool(
-    stack: ExitStack,
-    adapter: GenericAdapter,
-    config: XenoConfig,
-    *,
-    paths: RunPaths,
-    worktree: Path,
-) -> WarmPool:
-    """Bring up the gate image and its warm pool, registering teardown for
-    each as it is acquired — a failure partway through (image build, a
-    container that will not start) must not strand the ones already up."""
-    docker_client = docker.from_env()
-    stack.callback(docker_client.close)
-
-    image, network_disabled = prepare_gate_image(
-        docker_client,
-        adapter,
-        config.sandbox,
-        worktree=worktree,
-        workspace_root=paths.workspace,
-        secrets=config.secrets,
-    )
-    pool = WarmPool(
-        docker_client,
-        adapter,
-        config.sandbox,
-        workspace_root=paths.workspace / "sandboxes",
-        image=image,
-        network_disabled=network_disabled,
-    )
-    stack.callback(pool.shutdown)
-    pool.fill()
-    return pool
 
 
 def _seed_context_files(state: AgentState, worktree: Path, rels: list[str] | None) -> None:
@@ -726,7 +867,14 @@ def _copy_into_worktree(repo_root: Path, worktree: Path, config: XenoConfig) -> 
 def _print_run_summary(state: AgentState, worktree: Path) -> None:
     report = state.eval_report
     if state.halted:
-        console.print(Panel(f"[red]halted:[/] {state.halt_reason}", title="run result"))
+        halted = f"[red]halted:[/] {state.halt_reason}"
+        if state.unparsed_response is not None:
+            # Printed with the halt rather than filed with the artifacts
+            # below, because for a format failure this panel IS the end of
+            # the trail: the objection says the response was unusable, and
+            # nothing else on screen says what it actually was.
+            halted += f"\n\nraw response saved to {state.unparsed_response.path}"
+        console.print(Panel(halted, title="run result"))
     elif _run_succeeded(state):
         console.print(
             Panel(
@@ -850,16 +998,17 @@ tiers:
 nodes:
   planner:    {tier: flagship, max_tokens: 32000}   # Odysseus
   researcher: {tier: light}                         # Argus
+  specifier:  {tier: flagship, max_tokens: 32000}   # Lachesis
   coder:      {tier: medium}                        # Daedalus
   evaluator:  {tier: light}                         # Talos
   debugger:   {tier: medium}                        # Chiron
   reviewer:   {tier: flagship, max_tokens: 32000}   # Cerberus
 
 limits:
-  max_usd_per_run: 2.00
-  max_runtime_minutes: 45
-  max_iterations_per_task: 12
-  max_iterations_per_run: 60
+  max_usd_per_run: 10.00
+  max_runtime_minutes: 120
+  max_iterations_per_task: 25
+  max_iterations_per_run: 200
   max_rejections_per_run: 2
   max_deleted_lines: 200
 

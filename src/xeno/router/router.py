@@ -63,6 +63,16 @@ class RouterResult:
     record: CallRecord
     model: ModelSpec
     escalated: bool
+    #: Why the model stopped, and whether that means `text` is incomplete. A
+    #: node has to be able to tell "cut off mid-answer" from "ignored the
+    #: format": the two look identical to a parser and call for opposite
+    #: corrections.
+    finish_reason: str | None = None
+    truncated: bool = False
+    silent: bool = False
+    #: See `CompletionResult.reasoning` — kept for the record written when a
+    #: response cannot be parsed, never parsed as an answer itself.
+    reasoning: str = ""
 
 
 class Router:
@@ -300,15 +310,37 @@ class Router:
                 input_tokens=result.usage.input_tokens,
                 cached_tokens=result.usage.cache_read_tokens,
                 output_tokens=result.usage.output_tokens,
+                # Without these two, `output_tokens` is an unexplained number
+                # on any reasoning model: the tokens are billed as output but
+                # never appear in the text, so a node can look like it wrote
+                # four times what the parser was handed.
+                reasoning_tokens=result.usage.reasoning_tokens,
+                finish_reason=result.finish_reason,
                 usd=usd,
                 latency_ms=round(result.latency_ms, 2),
                 prefix_signature=record.prefix_signature,
             )
+            if result.truncated or result.silent:
+                self.runlog.event(
+                    EventKind.MODEL_INCOMPLETE,
+                    node=node.value,
+                    model=entry.ref,
+                    reason="truncated" if result.truncated else "empty_content",
+                    finish_reason=result.finish_reason,
+                    max_tokens=node_spec.max_tokens,
+                    output_tokens=result.usage.output_tokens,
+                    reasoning_tokens=result.usage.reasoning_tokens,
+                    visible_chars=len(result.text),
+                )
             return RouterResult(
                 text=result.text,
                 record=record,
                 model=entry,
                 escalated=escalated,
+                finish_reason=result.finish_reason,
+                truncated=result.truncated,
+                silent=result.silent,
+                reasoning=result.reasoning,
             )
 
         raise ChainExhaustedError(declared_tier, attempts)

@@ -1,6 +1,9 @@
-"""Phase 3: the full six-node graph (PRD S13) — Argus (skeleton) -> Odysseus
-(plan) -> per task [Argus (research) -> Daedalus -> Talos -> the L0-L5
-escalation ladder] -> next task or done.
+"""The full graph (PRD S13): two nested loops.
+
+Outer, once per run: Argus (skeleton) -> Odysseus (roadmap) -> per milestone
+[Lachesis (expand) -> ... -> Lachesis (verify)] -> Cerberus.
+Inner, once per task: Argus (research) -> Daedalus -> Talos -> the L0-L5
+escalation ladder -> next task, or the milestone's verification.
 
 Uses the same fake-provider technique as test_router.py: what is under test
 is graph/ladder/breaker/checkpoint wiring, not wire formats, so the network
@@ -29,10 +32,12 @@ from xeno.core.ledger import CostLedger
 from xeno.core.paths import RunPaths
 from xeno.core.runlog import NullRunLog
 from xeno.core.state import AgentState
-from xeno.core.types import DEFAULT_NODE_TIERS, NodeRole, Tier, Verdict
+from xeno.core.types import DEFAULT_NODE_TIERS, Breakpoint, NodeRole, Tier, Verdict
 from xeno.core.usage import Usage
-from xeno.graph.build import run_graph
+from xeno.graph.build import MAX_WRITE_REFUSALS, run_graph
 from xeno.graph.gates import GateOutcome
+from xeno.graph.lachesis import MAX_PLAN_OBJECTIONS
+from xeno.graph.plan import read_roadmap
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.providers.base import CompletionResult, Provider, ProviderError
 from xeno.router.router import Router
@@ -52,7 +57,16 @@ _TEST_TOOLCHAIN = DiscoveredToolchain(
             name="typecheck",
             argv=("python3", "-m", "mypy", "--no-error-summary", "--hide-error-context", "."),
         ),
-        DiscoveredCommand(name="test", argv=("python3", "-m", "pytest", "-q", "--tb=short")),
+        DiscoveredCommand(
+            name="test",
+            argv=("python3", "-m", "pytest", "-q", "--tb=short"),
+            #: What `xeno.adapters.discovery._classify` would derive for this
+            #: command, set explicitly since the fixture bypasses discovery.
+            #: Without it the gate profiles collapse into one and the
+            #: implementation runs would try to gate on tests that do not
+            #: exist yet.
+            is_test=True,
+        ),
     ),
     advisory=(),
     fingerprint="test-fixture",
@@ -60,12 +74,38 @@ _TEST_TOOLCHAIN = DiscoveredToolchain(
 
 DAEDALUS_OK = '<xeno-file path="pkg/mod.py">x = 1\n</xeno-file>'
 CHIRON_PATCH_OK = '<xeno-file path="pkg/mod.py">x = 2\n</xeno-file>'
-PLANNER_SINGLE_TASK = (
+
+#: Odysseus's output is a roadmap now — milestones, no acceptance criteria.
+ROADMAP_ONE = '<xeno-milestone outcome="pkg/mod.py works">build the module</xeno-milestone>'
+ROADMAP_TWO = (
+    '<xeno-milestone outcome="pkg/a.py works">build a</xeno-milestone>'
+    '<xeno-milestone outcome="pkg/b.py works">build b</xeno-milestone>'
+)
+ROADMAP_EXTRA = (
+    '<xeno-milestone outcome="pkg/mod2.py works">build the second thing</xeno-milestone>'
+)
+#: What Odysseus sends back after Lachesis objects: the same target, described
+#: in terms the specifier said it could actually decompose.
+ROADMAP_REPLANNED = (
+    '<xeno-milestone outcome="pkg/mod.py works">build the module from scratch</xeno-milestone>'
+)
+#: Lachesis refusing a milestone on the merits — the escape hatch, not the
+#: parser's "found no usable tags" fallback, which routes elsewhere.
+LACHESIS_OBJECTION = (
+    "<xeno-objection>this milestone says to extend the parser and no parser "
+    "exists in the repository</xeno-objection>"
+)
+
+#: Lachesis JOB 1 turns one milestone into tasks; JOB 2 writes its tests.
+EXPAND_SINGLE_TASK = (
     '<xeno-task acceptance="pkg/mod.py exists and gates pass">write pkg/mod.py</xeno-task>'
 )
-PLANNER_TWO_TASKS = (
+EXPAND_TWO_TASKS = (
     '<xeno-task acceptance="pkg/a.py exists and gates pass">write pkg/a.py</xeno-task>'
     '<xeno-task acceptance="pkg/b.py exists and gates pass">write pkg/b.py</xeno-task>'
+)
+LACHESIS_TESTS = (
+    '<xeno-file path="tests/test_mod.py">def test_mod():\n    assert True\n</xeno-file>'
 )
 ARGUS_SKELETON_TEXT = "A small Python package with no existing modules."
 ARGUS_NO_FILES = "<xeno-no-files>nothing to reference yet</xeno-no-files>"
@@ -109,7 +149,9 @@ class ScriptedProvider(Provider):
         name: str,
         spec: ProviderSpec,
         *,
-        planner_text: str | Callable[[], str] = PLANNER_SINGLE_TASK,
+        planner_text: str | Callable[[], str] = ROADMAP_ONE,
+        expand_text: str | Callable[[], str] = EXPAND_SINGLE_TASK,
+        verify_text: str | Callable[[], str] = LACHESIS_TESTS,
         skeleton_text: str = ARGUS_SKELETON_TEXT,
         research_text: str | Callable[[], str] = ARGUS_NO_FILES,
         daedalus_text: str | Callable[[], str] = DAEDALUS_OK,
@@ -120,6 +162,8 @@ class ScriptedProvider(Provider):
     ) -> None:
         super().__init__(name, spec)
         self.planner_text = planner_text
+        self.expand_text = expand_text
+        self.verify_text = verify_text
         self.skeleton_text = skeleton_text
         self.research_text = research_text
         self.daedalus_text = daedalus_text
@@ -141,6 +185,14 @@ class ScriptedProvider(Provider):
             text = self.chiron_text() if callable(self.chiron_text) else self.chiron_text
         elif prompt.node is NodeRole.PLANNER:
             text = self.planner_text() if callable(self.planner_text) else self.planner_text
+        elif prompt.node is NodeRole.SPECIFIER:
+            # Lachesis's two jobs share one system text (PRD T8), so they are
+            # told apart by the current turn's selector — exactly as Argus's
+            # three are, and as the real router's caller does.
+            source = (
+                self.expand_text if prompt.current_turn.startswith("JOB 1") else self.verify_text
+            )
+            text = source() if callable(source) else source
         elif prompt.node is NodeRole.RESEARCHER:
             if prompt.current_turn.startswith("JOB 1"):
                 text = self.skeleton_text
@@ -186,6 +238,31 @@ class FakePool:
 
     def release(self, sandbox: _FakeSandbox) -> None:
         pass
+
+
+class FakeSession:
+    """Stands in for `xeno.graph.toolchain.ToolchainSession`.
+
+    The toolchain is fixed and `refresh_if_stale` is a no-op: mid-run
+    re-discovery has its own tests (`tests/test_toolchain.py`), and wiring a
+    live one in here would make every ladder test depend on a model call it
+    has nothing to say about.
+    """
+
+    def __init__(
+        self,
+        *,
+        pool: object | None = None,
+        toolchain: DiscoveredToolchain = _TEST_TOOLCHAIN,
+    ) -> None:
+        self.pool = pool or FakePool()
+        self.toolchain = toolchain
+        self.adapter = GenericAdapter(toolchain)
+        self.refresh_calls = 0
+
+    def refresh_if_stale(self, state: object) -> bool:
+        self.refresh_calls += 1
+        return False
 
 
 def pass_outcome() -> GateOutcome:
@@ -242,15 +319,16 @@ def _run(
     run_paths: RunPaths,
     *,
     goal: str = "write pkg/mod.py",
-    planner_text: str | Callable[[], str] = PLANNER_SINGLE_TASK,
+    planner_text: str | Callable[[], str] = ROADMAP_ONE,
+    expand_text: str | Callable[[], str] = EXPAND_SINGLE_TASK,
+    verify_text: str | Callable[[], str] = LACHESIS_TESTS,
     skeleton_text: str = ARGUS_SKELETON_TEXT,
     research_text: str | Callable[[], str] = ARGUS_NO_FILES,
     daedalus_text: str | Callable[[], str] = DAEDALUS_OK,
     chiron_text: str | Callable[[], str] = CHIRON_PATCH_OK,
     reviewer_text: str | Callable[[], str] = CERBERUS_APPROVE,
     fail_reviewer: bool = False,
-    pool: object | None = None,
-    adapter: GenericAdapter | None = None,
+    session: object | None = None,
 ) -> tuple[AgentState, ScriptedProvider]:
     ledger = CostLedger(run_id="t")
     router = Router(graph_config, ledger=ledger)
@@ -258,6 +336,8 @@ def _run(
         "ollama",
         graph_config.providers["ollama"],
         planner_text=planner_text,
+        expand_text=expand_text,
+        verify_text=verify_text,
         skeleton_text=skeleton_text,
         research_text=research_text,
         daedalus_text=daedalus_text,
@@ -276,8 +356,7 @@ def _run(
         worktree=worktree,
         runlog=NullRunLog(),
         state=state,
-        pool=pool or FakePool(),  # type: ignore[arg-type]
-        adapter=adapter or GenericAdapter(_TEST_TOOLCHAIN),
+        session=session or FakeSession(),  # type: ignore[arg-type]
         repo_root=run_paths.repo_root,
     )
     return final, fake
@@ -286,7 +365,7 @@ def _run(
 def _script_gates(monkeypatch: pytest.MonkeyPatch, outcomes: list[GateOutcome]) -> None:
     queue = list(outcomes)
 
-    def fake_run_gates(sandbox, toolchain):  # type: ignore[no-untyped-def]
+    def fake_run_gates(sandbox, toolchain, **kwargs):  # type: ignore[no-untyped-def]
         return queue.pop(0) if queue else outcomes[-1]
 
     monkeypatch.setattr("xeno.graph.talos.run_gates", fake_run_gates)
@@ -331,7 +410,15 @@ def real_pool(tmp_path: Path) -> Iterator[WarmPool]:
 def test_happy_path_passes_with_real_sandbox_and_gates(
     graph_config: XenoConfig, worktree: Path, run_paths: RunPaths, real_pool: WarmPool
 ) -> None:
-    final, fake = _run(graph_config, worktree, run_paths, pool=real_pool)
+    # Deliberately NO test fixture on disk. `pytest` exits 5 ("no tests
+    # collected") on an empty suite, which `run_gates` correctly reads as a
+    # failed required command — so this run can only go green if the gate
+    # profiles do what they claim: the implementation task gates on
+    # lint+typecheck with the test command held back, and pytest runs for the
+    # first time on the verification pass, against the test Lachesis itself
+    # wrote. Adding a placeholder here would hide exactly the behaviour under
+    # test.
+    final, fake = _run(graph_config, worktree, run_paths, session=FakeSession(pool=real_pool))
 
     assert final.eval_report is not None
     assert final.eval_report.passed
@@ -339,17 +426,24 @@ def test_happy_path_passes_with_real_sandbox_and_gates(
     assert final.ladder_rung == 0
     assert final.rung_attempts == 0
     assert (worktree / "pkg" / "mod.py").read_text() == "x = 1"
+    assert (worktree / "tests" / "test_mod.py").is_file(), "Lachesis wrote the milestone's tests"
     assert final.task_count == 1
     assert final.task_cursor == 1
-    assert len(final.checkpoints) == 1
+    assert final.milestone_cursor == 1
+    # Two: the task's own green, then the milestone's, which is the first
+    # evaluation in the run where the test command actually ran.
+    assert len(final.checkpoints) == 2
     assert final.review_verdict is Verdict.APPROVE
-    # Skeleton, plan, per-task research, the one write, then Cerberus's
-    # review — no failure, so no triage call and no Chiron call was ever made.
+    # Skeleton, roadmap, expand, per-task research, the one write, the
+    # milestone's tests, then Cerberus's review — no failure, so no triage
+    # call and no Chiron call was ever made.
     assert fake.calls == [
         NodeRole.RESEARCHER,
         NodeRole.PLANNER,
+        NodeRole.SPECIFIER,
         NodeRole.RESEARCHER,
         NodeRole.CODER,
+        NodeRole.SPECIFIER,
         NodeRole.REVIEWER,
     ]
 
@@ -498,9 +592,11 @@ def test_chiron_refuses_to_patch_a_test_file(
         graph_config,
         worktree,
         run_paths,
-        chiron_text='<xeno-file path="tests/test_mod.py">assert True\n</xeno-file>',
+        chiron_text='<xeno-file path="tests/test_chiron.py">assert True\n</xeno-file>',
     )
-    assert not (worktree / "tests").exists()  # every refused write, nothing ever landed
+    # A distinct path from the one Lachesis legitimately writes, so this
+    # asserts Chiron's write never landed rather than that no test exists.
+    assert not (worktree / "tests" / "test_chiron.py").exists()
     assert final.eval_report is not None
     assert final.eval_report.passed
     assert final.ladder_rung == 0  # reset by checkpoint_step on completion
@@ -694,7 +790,8 @@ def test_l2_re_research_engages_after_l1_is_exhausted_and_recovers(
     assert fake.calls.count(NodeRole.DEBUGGER) == 4  # L1's 3 attempts + L2's 1
     # skeleton (once) + initial per-task research (rung 0) + L2 re-research
     assert fake.calls.count(NodeRole.RESEARCHER) == 3
-    assert len(final.checkpoints) == 1
+    # The task's own green, then the milestone's once its tests pass.
+    assert len(final.checkpoints) == 2
 
 
 def test_l3_rollback_and_rewrite_engages_after_l2_is_exhausted(
@@ -730,21 +827,27 @@ def test_l3_rollback_and_rewrite_engages_after_l2_is_exhausted(
     # since no checkpoint exists yet for this still-incomplete task)
     # actually cleared the worktree before Daedalus wrote again.
     assert (worktree / "pkg" / "mod.py").read_text() == "x = 99"
-    assert len(final.checkpoints) == 1
+    assert len(final.checkpoints) == 2  # the task's, then the milestone's
     assert len(final.checkpoints[0].sha) == 40
 
 
-def test_l4_replan_engages_after_l3_is_exhausted_and_halts_at_l5_if_it_still_fails(
+def test_l4_reexpand_engages_after_l3_is_exhausted_and_halts_at_l5_if_it_still_fails(
     graph_config: XenoConfig,
     worktree: Path,
     run_paths: RunPaths,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Also proves the ladder is monotonic (`AgentState.ladder_rung`'s
-    docstring): once L4's single re-plan attempt fails too, the run halts
+    docstring): once L4's single re-expansion attempt fails too, the run halts
     straight to L5 rather than re-descending through L0-L3 with fresh
     budgets, which would make the breaker's bounded-attempts guarantee
-    meaningless."""
+    meaningless.
+
+    L4 goes to Lachesis, not Odysseus: the task that got stuck is one
+    Lachesis wrote, and re-deriving the whole roadmap over a single
+    unachievable task would throw away milestones that are already built and
+    tested.
+    """
     _script_gates(monkeypatch, [fail_outcome(signature=str(i)) for i in range(10)])
     daedalus_counter = iter(range(1, 20))
     chiron_counter = iter(range(100, 120))
@@ -763,7 +866,8 @@ def test_l4_replan_engages_after_l3_is_exhausted_and_halts_at_l5_if_it_still_fai
     assert final.ladder_rung == 4
     assert fake.calls.count(NodeRole.CODER) == 4  # initial + 2 L3 rounds + 1 L4 rewrite
     assert fake.calls.count(NodeRole.DEBUGGER) == 5  # L1's 3 + L2's 2
-    assert fake.calls.count(NodeRole.PLANNER) == 2  # initial plan + the L4 re-plan
+    assert fake.calls.count(NodeRole.PLANNER) == 1, "the roadmap is never re-derived by the ladder"
+    assert fake.calls.count(NodeRole.SPECIFIER) == 2  # initial expansion + the L4 re-expansion
     assert fake.calls.count(NodeRole.RESEARCHER) == 5  # skeleton + initial + 2xL2 + L4
     assert final.checkpoints == []  # the task never passed, so nothing was ever committed
 
@@ -785,18 +889,20 @@ def test_two_task_plan_checkpoints_each_task_and_advances_the_cursor(
         graph_config,
         worktree,
         run_paths,
-        planner_text=PLANNER_TWO_TASKS,
+        expand_text=EXPAND_TWO_TASKS,
         daedalus_text=lambda: next(daedalus_responses),
     )
 
     assert not final.halted
     assert final.task_count == 2
     assert final.task_cursor == 2
-    assert len(final.checkpoints) == 2
-    assert [cp.task_index for cp in final.checkpoints] == [0, 1]
+    # One per task, plus the milestone's own once its tests pass.
+    assert len(final.checkpoints) == 3
+    assert [cp.task_index for cp in final.checkpoints] == [0, 1, 2]
     assert (worktree / "pkg" / "a.py").read_text() == "a = 1"
     assert (worktree / "pkg" / "b.py").read_text() == "b = 1"
-    assert fake.calls.count(NodeRole.PLANNER) == 1  # one plan, never re-planned
+    assert fake.calls.count(NodeRole.PLANNER) == 1  # one roadmap, never revised
+    assert fake.calls.count(NodeRole.SPECIFIER) == 2  # one expansion + one verification
     assert fake.calls.count(NodeRole.CODER) == 2
     assert fake.calls.count(NodeRole.DEBUGGER) == 0  # both tasks pass on the first try
     # skeleton (once) + one research call per task
@@ -901,23 +1007,34 @@ def test_e16_reject_to_daedalus_appends_a_task_and_the_run_still_completes(
     assert final.reject_count == 1
     assert final.reject_destination is None  # cleared once Daedalus consumed it
     assert final.task_count == 2  # the original task plus Cerberus's appended one
-    assert len(final.checkpoints) == 2
+    # The task's, the milestone's, then the appended fix task's.
+    assert len(final.checkpoints) == 3
+    assert final.task_cursor == 2, "the appended fix is a task and advances the cursor"
     assert fake.calls.count(NodeRole.REVIEWER) == 2
     assert fake.calls.count(NodeRole.CODER) == 2  # original write + the fix
     assert fake.calls.count(NodeRole.PLANNER) == 1  # never routed to Odysseus
 
 
-def test_e17_reject_to_odysseus_replans_and_the_run_still_completes(
+def test_e17_reject_to_odysseus_extends_the_roadmap_and_the_run_still_completes(
     graph_config: XenoConfig,
     worktree: Path,
     run_paths: RunPaths,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _script_gates(monkeypatch, [pass_outcome(), pass_outcome()])
+    """A PLANNER rejection now operates at roadmap level.
+
+    Every milestone already passed its own tests by the time Cerberus sees the
+    run, so the objection can only be that the roadmap was incomplete — the
+    answer is another milestone, which Lachesis then expands like any other.
+    """
+    _script_gates(monkeypatch, [pass_outcome()])
     reviewer_responses = iter([CERBERUS_REJECT_ODYSSEUS, CERBERUS_APPROVE])
-    planner_responses = iter(
+    # Odysseus keeps the milestones already built and appends to them, so the
+    # rejection response carries only the milestone that was missing.
+    planner_responses = iter([ROADMAP_ONE, ROADMAP_EXTRA])
+    expand_responses = iter(
         [
-            PLANNER_SINGLE_TASK,
+            EXPAND_SINGLE_TASK,
             '<xeno-task acceptance="pkg/mod2.py exists and gates pass">'
             "write pkg/mod2.py</xeno-task>",
         ]
@@ -929,6 +1046,7 @@ def test_e17_reject_to_odysseus_replans_and_the_run_still_completes(
         run_paths,
         reviewer_text=lambda: next(reviewer_responses),
         planner_text=lambda: next(planner_responses),
+        expand_text=lambda: next(expand_responses),
         daedalus_text=lambda: next(daedalus_responses),
     )
 
@@ -936,11 +1054,113 @@ def test_e17_reject_to_odysseus_replans_and_the_run_still_completes(
     assert final.review_verdict is Verdict.APPROVE
     assert final.reject_count == 1
     assert final.reject_destination is None  # cleared once Odysseus consumed it
-    assert final.task_count == 2  # completed task kept, one new task appended
-    assert len(final.checkpoints) == 2
+    assert final.milestone_count == 2  # the completed milestone kept, one appended
+    assert final.milestone_cursor == 2
+    assert final.task_count == 2  # completed task kept, the new milestone's appended
     assert fake.calls.count(NodeRole.REVIEWER) == 2
-    assert fake.calls.count(NodeRole.PLANNER) == 2  # initial plan + the E17 replan
+    assert fake.calls.count(NodeRole.PLANNER) == 2  # initial roadmap + the E17 extension
+    assert fake.calls.count(NodeRole.SPECIFIER) == 4  # expand + verify, per milestone
     assert (worktree / "pkg" / "mod2.py").read_text() == "y = 1"
+
+
+def test_a_lachesis_objection_sends_the_milestone_back_to_odysseus(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A milestone that cannot be expanded is a defect in the roadmap, and
+    Odysseus is the only node that may rewrite one.
+
+    This is the run that used to die: the objection was the whole halt reason
+    and nobody acted on it. Odysseus had never been told, even though it wrote
+    the milestone and could have replaced it.
+    """
+    _script_gates(monkeypatch, [pass_outcome()])
+    planner_turns: list[str] = []
+
+    class _Recording(ScriptedProvider):
+        def complete(self, prompt, model, **kwargs):  # type: ignore[no-untyped-def]
+            if prompt.node is NodeRole.PLANNER:
+                planner_turns.append(prompt.current_turn)
+            return super().complete(prompt, model, **kwargs)
+
+    planner_responses = iter([ROADMAP_ONE, ROADMAP_REPLANNED])
+    expand_responses = iter([LACHESIS_OBJECTION, EXPAND_SINGLE_TASK])
+    ledger = CostLedger(run_id="t")
+    router = Router(graph_config, ledger=ledger)
+    fake = _Recording(
+        "ollama",
+        graph_config.providers["ollama"],
+        planner_text=lambda: next(planner_responses),
+        expand_text=lambda: next(expand_responses),
+    )
+    router._providers["ollama"] = fake
+    final = run_graph(
+        router=router,
+        config=graph_config,
+        keyring=CacheKeyring(run_id="t", worktree_root=worktree),
+        paths=run_paths,
+        worktree=worktree,
+        runlog=NullRunLog(),
+        state=AgentState(run_id="t", goal="write pkg/mod.py"),
+        session=FakeSession(),  # type: ignore[arg-type]
+        repo_root=run_paths.repo_root,
+    )
+
+    assert not final.halted
+    assert final.review_verdict is Verdict.APPROVE
+    assert final.plan_objection is None, "cleared once Odysseus consumed it"
+    assert final.plan_objection_count == 0, "the re-planned milestone expanded, so the budget reset"
+    assert fake.calls.count(NodeRole.PLANNER) == 2  # the roadmap, then the re-plan
+
+    # The re-plan is a repair, not a re-roll: Odysseus is told which milestone
+    # was refused and why, or the second call is the same prompt as the first.
+    assert "no parser exists in the repository" in planner_turns[1]
+    assert "milestone 1 of 1" in planner_turns[1]
+    assert "build the module" in planner_turns[1], "the refused milestone is quoted back"
+
+    # And its answer replaced the milestone rather than being appended beside it.
+    assert final.roadmap is not None
+    assert [m.description for m in read_roadmap(final.roadmap).milestones] == [
+        "build the module from scratch"
+    ]
+    assert final.milestone_count == 1
+    assert (worktree / "pkg" / "mod.py").exists()
+
+
+def test_the_objection_budget_halts_to_cerberus_once_odysseus_cannot_fix_it(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cycle is bounded like every other one in this graph, and what the
+    bound buys is a diagnosis: three objections mean Odysseus re-planned with
+    the objections in hand and the milestone stayed unbuildable, so the fault
+    is upstream of both nodes."""
+    _script_gates(monkeypatch, [pass_outcome()])
+    final, fake = _run(
+        graph_config,
+        worktree,
+        run_paths,
+        expand_text=LACHESIS_OBJECTION,
+    )
+
+    assert final.halted
+    assert final.plan_objection_count == MAX_PLAN_OBJECTIONS
+    assert final.plan_objection is None, "an exhausted budget routes to Cerberus, not Odysseus"
+    reason = final.halt_reason or ""
+    assert "no parser exists in the repository" in reason
+    assert "still not expandable" in reason
+
+    # Odysseus was re-entered for every objection except the last, which had
+    # no budget left to spend on it.
+    assert fake.calls.count(NodeRole.PLANNER) == MAX_PLAN_OBJECTIONS
+    assert fake.calls.count(NodeRole.SPECIFIER) == MAX_PLAN_OBJECTIONS
+    # A halt is Cerberus's to resolve, and nothing was ever built to review.
+    assert final.review_verdict is Verdict.ESCALATE
+    assert not (worktree / "pkg").exists()
 
 
 def test_reject_budget_exhaustion_converts_the_third_rejection_to_escalate(
@@ -965,7 +1185,8 @@ def test_reject_budget_exhaustion_converts_the_third_rejection_to_escalate(
     assert final.reject_count == 2  # Limits().max_rejections_per_run
     assert final.ladder_rung == 0  # the reject budget never touches the ladder
     assert final.task_count == 3  # original + 2 appended-then-rejected-again tasks
-    assert len(final.checkpoints) == 3
+    # The first task's, the milestone's, then one per appended fix task.
+    assert len(final.checkpoints) == 4
     assert fake.calls.count(NodeRole.REVIEWER) == 3
 
 
@@ -1042,3 +1263,310 @@ def test_cerberus_is_told_when_the_run_modified_test_files() -> None:
     flagged = _build_current_turn(state, plan, "diff")
     assert "modified test file(s): tests/test_limits.py" in flagged
     assert "weakened to make the gates pass" in flagged
+
+
+# ---- the plan reaches the nodes that act on it ----------------------------
+
+
+def _plan_handle(tmp_path: Path, description: str, acceptance: str) -> object:
+    from xeno.core.state import Handle
+    from xeno.graph.plan import Plan, PlanTask, write_plan
+
+    path = tmp_path / "plan.json"
+    write_plan(path, Plan(tasks=[PlanTask(description=description, acceptance=acceptance)]))
+    return Handle.for_file(path, summary="plan")
+
+
+def test_daedalus_is_told_the_current_task_not_just_the_goal(tmp_path: Path) -> None:
+    """`DAEDALUS_SYSTEM` instructs this node to implement "the current plan
+    task". Until the task was actually supplied, that pointed at nothing and
+    every task in the plan was implemented as the whole goal — on a
+    greenfield run, the scaffold task produced the finished feature and the
+    toolchain the rest of the plan depended on was never created.
+    """
+    from xeno.graph.daedalus import _build_current_turn
+
+    state = AgentState(run_id="t", goal="build a calculator library")
+    state.plan = _plan_handle(  # type: ignore[assignment]
+        tmp_path, "Create pyproject.toml and a placeholder test", "pytest exits 0"
+    )
+    state.task_count = 1
+
+    turn = _build_current_turn(state, "")
+
+    assert "Create pyproject.toml and a placeholder test" in turn
+    assert "pytest exits 0" in turn
+    assert "build a calculator library" in turn, "the goal is still the context"
+
+
+def test_chiron_is_told_the_current_task_too(tmp_path: Path) -> None:
+    """The gates that just failed were evaluating the CURRENT task, so a
+    repair has to target that rather than the plan's destination."""
+    from xeno.core.state import EvalReport
+    from xeno.graph.chiron import _build_current_turn
+
+    state = AgentState(run_id="t", goal="build a calculator library")
+    state.plan = _plan_handle(  # type: ignore[assignment]
+        tmp_path, "Create pyproject.toml and a placeholder test", "pytest exits 0"
+    )
+    state.eval_report = EvalReport(passed=False, failed_command="test", first_failure="boom")
+
+    turn = _build_current_turn(state, "")
+
+    assert "Create pyproject.toml and a placeholder test" in turn
+    assert "pytest exits 0" in turn
+
+
+def test_chiron_is_told_why_its_last_patch_was_refused(tmp_path: Path) -> None:
+    """A refusal the offender cannot see is indistinguishable from the patch
+    silently failing — which is how one refused block burns a whole rung."""
+    from xeno.core.state import EvalReport
+    from xeno.graph.chiron import _build_current_turn
+
+    state = AgentState(run_id="t", goal="g")
+    state.eval_report = EvalReport(passed=False, failed_command="lint", first_failure="W292")
+
+    turn = _build_current_turn(state, "patch touched test file(s), refused: tests/test_x.py")
+
+    assert "refused" in turn
+    assert "tests/test_x.py" in turn
+    assert "NOTHING was written" in turn
+
+
+def test_write_nodes_fall_back_to_the_goal_when_no_plan_exists() -> None:
+    """Neither write node should crash a run over a missing plan."""
+    from xeno.graph.daedalus import _build_current_turn
+
+    state = AgentState(run_id="t", goal="do the thing")
+    assert "do the thing" in _build_current_turn(state, "")
+
+
+# ---- greenfield planning --------------------------------------------------
+
+
+EXPANSION_IGNORES_SCAFFOLD = '<xeno-task acceptance="mod exists">add pkg/x.py</xeno-task>'
+
+
+def _greenfield_plan(
+    graph_config: XenoConfig, worktree: Path, run_paths: RunPaths, established: bool
+) -> list[str]:
+    from xeno.core.ledger import CostLedger as _Ledger
+    from xeno.core.state import Handle
+    from xeno.graph.lachesis import make_lachesis_nodes
+    from xeno.graph.plan import Roadmap, read_plan, write_roadmap
+
+    router = Router(graph_config, ledger=_Ledger(run_id="t"))
+    router._providers["ollama"] = ScriptedProvider(
+        "ollama", graph_config.providers["ollama"], expand_text=EXPANSION_IGNORES_SCAFFOLD
+    )
+    expand, _verify = make_lachesis_nodes(
+        router=router,
+        config=graph_config,
+        keyring=CacheKeyring(run_id="t", worktree_root=worktree),
+        paths=run_paths,
+        worktree=worktree,
+        touched_files=[],
+        toolchain_established=lambda: established,
+        report_refused=lambda _refused: None,
+    )
+
+    roadmap_path = run_paths.workspace / "roadmap.json"
+    write_roadmap(roadmap_path, Roadmap(milestones=[_milestone("build the thing", "it works")]))
+
+    state = AgentState(run_id="t", goal="build a thing")
+    state.roadmap = Handle.for_file(roadmap_path, summary="roadmap")
+    state.milestone_count = 1
+
+    state = expand(state)
+    assert state.plan is not None
+    return [t.description for t in read_plan(state.plan).tasks]
+
+
+def _milestone(description: str, outcome: str) -> object:
+    from xeno.graph.plan import Milestone
+
+    return Milestone(description=description, outcome=outcome)
+
+
+def test_a_greenfield_expansion_always_starts_by_establishing_the_toolchain(
+    graph_config: XenoConfig, worktree: Path, run_paths: RunPaths
+) -> None:
+    """The scaffold task is prepended by the harness, not requested from a
+    model. A greenfield plan that does not begin by creating a manifest
+    cannot gate a single one of its own tasks — every later task fails on
+    "no toolchain" until the ladder gives up — and a real model was observed
+    skipping it despite being told not to.
+    """
+    tasks = _greenfield_plan(graph_config, worktree, run_paths, established=False)
+
+    assert len(tasks) == 2
+    assert "Establish this project's toolchain" in tasks[0]
+    assert tasks[1] == "add pkg/x.py", "the expansion's own tasks still follow"
+
+
+def test_the_scaffold_task_no_longer_asks_for_a_placeholder_test(
+    graph_config: XenoConfig, worktree: Path, run_paths: RunPaths
+) -> None:
+    """It used to, purely to dodge `pytest` exiting 5 on an empty suite. That
+    reason is gone — the test command is held back until Lachesis has written
+    tests — and the requirement is now actively wrong, since Daedalus is
+    refused any write that touches a test file."""
+    scaffold = _greenfield_plan(graph_config, worktree, run_paths, established=False)[0]
+    assert "placeholder test" not in scaffold
+
+
+def test_an_established_toolchain_gets_no_scaffold_task(
+    graph_config: XenoConfig, worktree: Path, run_paths: RunPaths
+) -> None:
+    tasks = _greenfield_plan(graph_config, worktree, run_paths, established=True)
+    assert tasks == ["add pkg/x.py"]
+
+
+# ---- the milestone loop ---------------------------------------------------
+
+
+def test_a_two_milestone_roadmap_expands_and_verifies_each_one_in_turn(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of the split: the second milestone is expanded AFTER
+    the first one's code is on disk, so its tasks can name real code instead
+    of predicting it."""
+    _script_gates(monkeypatch, [pass_outcome()])
+    expand_responses = iter(
+        [
+            '<xeno-task acceptance="pkg/a.py exists">write pkg/a.py</xeno-task>',
+            '<xeno-task acceptance="pkg/b.py exists">write pkg/b.py</xeno-task>',
+        ]
+    )
+    verify_responses = iter(
+        [
+            '<xeno-file path="tests/test_a.py">def test_a():\n    assert True\n</xeno-file>',
+            '<xeno-file path="tests/test_b.py">def test_b():\n    assert True\n</xeno-file>',
+        ]
+    )
+    daedalus_responses = iter(
+        [
+            '<xeno-file path="pkg/a.py">a = 1\n</xeno-file>',
+            '<xeno-file path="pkg/b.py">b = 1\n</xeno-file>',
+        ]
+    )
+    final, fake = _run(
+        graph_config,
+        worktree,
+        run_paths,
+        planner_text=ROADMAP_TWO,
+        expand_text=lambda: next(expand_responses),
+        verify_text=lambda: next(verify_responses),
+        daedalus_text=lambda: next(daedalus_responses),
+    )
+
+    assert not final.halted
+    assert final.milestone_count == 2
+    assert final.milestone_cursor == 2
+    assert final.task_count == 2, "the plan grew one milestone at a time"
+    assert (worktree / "tests" / "test_a.py").is_file()
+    assert (worktree / "tests" / "test_b.py").is_file()
+    # 2 tasks + 2 milestones.
+    assert len(final.checkpoints) == 4
+    assert fake.calls.count(NodeRole.PLANNER) == 1  # one roadmap for the whole run
+    assert fake.calls.count(NodeRole.SPECIFIER) == 4  # expand + verify, twice
+
+
+def test_the_second_expansion_sees_the_first_milestones_code(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not merely that it runs later — that the codebase map it is handed
+    actually contains what the previous milestone built. This is the entire
+    reason expansion was split out of planning."""
+    _script_gates(monkeypatch, [pass_outcome()])
+    turns: list[str] = []
+
+    class _Recording(ScriptedProvider):
+        def complete(self, prompt, model, **kwargs):  # type: ignore[no-untyped-def]
+            if prompt.node is NodeRole.SPECIFIER and prompt.current_turn.startswith("JOB 1"):
+                block = prompt.block(Breakpoint.CODEBASE_MAP)
+                turns.append(block.text if block else "")
+            return super().complete(prompt, model, **kwargs)
+
+    ledger = CostLedger(run_id="t")
+    router = Router(graph_config, ledger=ledger)
+    router._providers["ollama"] = _Recording(
+        "ollama",
+        graph_config.providers["ollama"],
+        planner_text=ROADMAP_TWO,
+        daedalus_text='<xeno-file path="pkg/first.py">FIRST = 1\n</xeno-file>',
+    )
+    run_graph(
+        router=router,
+        config=graph_config,
+        keyring=CacheKeyring(run_id="t", worktree_root=worktree),
+        paths=run_paths,
+        worktree=worktree,
+        runlog=NullRunLog(),
+        state=AgentState(run_id="t", goal="build a thing"),
+        session=FakeSession(),  # type: ignore[arg-type]
+        repo_root=run_paths.repo_root,
+    )
+
+    assert len(turns) == 2
+    assert "pkg/first.py" not in turns[0], "nothing existed when the first expansion ran"
+    assert "pkg/first.py" in turns[1], "the second expansion can name what was actually built"
+
+
+# ---- test authorship is exclusive to Lachesis -----------------------------
+
+
+def test_daedalus_bundling_a_test_file_is_refused_and_retried(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused WHOLE, then retried — never evaluated in between.
+
+    Falling through to Talos after a refused write would be actively wrong:
+    nothing was written, so the worktree still holds the previous task's green
+    state and the gates would checkpoint a task that implemented nothing.
+    """
+    _script_gates(monkeypatch, [pass_outcome()])
+    daedalus_responses = iter(
+        [
+            '<xeno-file path="pkg/mod.py">x = 1\n</xeno-file>'
+            '<xeno-file path="tests/test_mine.py">assert True\n</xeno-file>',
+            DAEDALUS_OK,
+        ]
+    )
+    final, fake = _run(
+        graph_config, worktree, run_paths, daedalus_text=lambda: next(daedalus_responses)
+    )
+
+    assert not final.halted
+    assert not (worktree / "tests" / "test_mine.py").exists()
+    assert (worktree / "pkg" / "mod.py").read_text() == "x = 1", "the retry's write landed"
+    assert fake.calls.count(NodeRole.CODER) == 2  # the refused attempt, then the clean one
+
+
+def test_daedalus_refusing_forever_halts_rather_than_looping(
+    graph_config: XenoConfig,
+    worktree: Path,
+    run_paths: RunPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _script_gates(monkeypatch, [pass_outcome()])
+    final, fake = _run(
+        graph_config,
+        worktree,
+        run_paths,
+        daedalus_text='<xeno-file path="tests/test_mine.py">assert True\n</xeno-file>',
+    )
+
+    assert final.halted
+    assert "tests are Lachesis's to write" in (final.halt_reason or "")
+    assert fake.calls.count(NodeRole.CODER) == MAX_WRITE_REFUSALS
+    assert final.review_verdict is Verdict.ESCALATE, "a halt still reaches the human gate"

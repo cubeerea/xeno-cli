@@ -55,6 +55,26 @@ class CompletionResult:
     #: not a per-block split, so this is attributed by the router from the
     #: prompt's own block sizes (see `attribute_cache_to_breakpoints`).
     by_breakpoint: dict[Breakpoint, BreakpointStats] = field(default_factory=dict)
+    #: The provider's own stop reason, verbatim. "length" means the response
+    #: was cut off by max_tokens — a state the harness previously could not
+    #: observe at all, so a response truncated mid-block was reported as a
+    #: model that ignored the format.
+    finish_reason: str | None = None
+    #: A reasoning model's scratchpad, when the provider returns it OUTSIDE
+    #: `content`. Carried for diagnosis and NEVER parsed as an answer: a
+    #: scratchpad routinely contains draft tags the model then revised, and
+    #: acting on those would execute a plan it had already discarded.
+    reasoning: str = ""
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
+
+    @property
+    def silent(self) -> bool:
+        """Output tokens were billed but the text came back empty — the answer
+        never left the reasoning channel."""
+        return not self.text.strip() and self.usage.output_tokens > 0
 
 
 class Provider(ABC):

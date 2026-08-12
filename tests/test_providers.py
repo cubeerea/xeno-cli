@@ -21,6 +21,7 @@ from xeno.router.providers.ollama import OllamaProvider, parse_ollama_usage
 from xeno.router.providers.openai_compat import (
     OpenAICompatProvider,
     OpenRouterProvider,
+    _extract_message,
     parse_openai_usage,
 )
 
@@ -251,3 +252,70 @@ def test_prefix_cache_support_defaults_to_false_so_the_warning_can_fire() -> Non
 
     assert Provider.supports_prefix_cache(object()) is False  # type: ignore[arg-type]
     assert OllamaProvider("ollama", OLLAMA).supports_prefix_cache() is True
+
+
+# ---- reasoning models -----------------------------------------------------
+#
+# A run halted because a node's response "contained no tags". Reconstructing
+# it from prompt-size arithmetic showed 2,473 billed output tokens against
+# roughly 636 tokens of visible text: the rest was reasoning, dropped at this
+# boundary and therefore invisible to every later diagnosis.
+
+
+def test_reasoning_is_read_from_whichever_field_the_provider_uses() -> None:
+    for field in ("reasoning", "reasoning_content"):
+        body = {"choices": [{"message": {"content": "answer", "field": "x"}}]}
+        body["choices"][0]["message"][field] = "let me think"
+        text, reasoning, _ = _extract_message(body, provider="p")
+        assert (text, reasoning) == ("answer", "let me think"), field
+
+
+def test_openrouter_structured_reasoning_details_are_read_too() -> None:
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": "answer",
+                    "reasoning_details": [{"text": "step one "}, {"summary": "step two"}],
+                }
+            }
+        ]
+    }
+    _, reasoning, _ = _extract_message(body, provider="p")
+    assert reasoning == "step one step two"
+
+
+def test_a_finish_reason_of_length_is_carried_out_of_the_provider() -> None:
+    """Truncation used to be undetectable at every layer, so a response cut
+    off mid-block was reported as a model that ignored the format — and one
+    cut off just AFTER a block parsed cleanly into a silently short result."""
+    body = {"choices": [{"finish_reason": "length", "message": {"content": "half an ans"}}]}
+    _, _, finish = _extract_message(body, provider="p")
+    assert finish == "length"
+
+
+def test_an_empty_content_field_is_not_mistaken_for_a_short_answer() -> None:
+    """`str(None or "")` returns "" with no error and no event, which is how a
+    response that never left the reasoning channel became indistinguishable
+    from prose."""
+    body = {"choices": [{"message": {"content": None, "reasoning": "all of it"}}]}
+    text, reasoning, _ = _extract_message(body, provider="p")
+    assert text == ""
+    assert reasoning == "all of it"
+
+
+def test_reasoning_tokens_are_counted_as_the_output_subset_they_are() -> None:
+    usage = parse_openai_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 2473,
+            "completion_tokens_details": {"reasoning_tokens": 1837},
+        }
+    )
+    assert usage.output_tokens == 2473
+    assert usage.reasoning_tokens == 1837
+
+
+def test_a_provider_claiming_more_reasoning_than_output_is_rejected() -> None:
+    with pytest.raises(ValueError, match="exceed total output"):
+        Usage(output_tokens=10, reasoning_tokens=11)

@@ -16,22 +16,53 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from xeno.core.types import GateProfile
+
 #: PRD S11.1: one base image, built once and cached locally by the Docker
 #: daemon. Broader than the old PythonAdapter's image on purpose — adding
 #: language #N means adding a runtime to THIS Dockerfile, not writing a new
 #: adapter class.
 _IMAGE_TAG = "xeno-generic-adapter:1"
 
+#: The build/manifest files that declare a repository's toolchain. Lives here
+#: rather than in `xeno.adapters.discovery` because three unrelated layers
+#: need it — discovery (fingerprint + prompt content), the sandbox's
+#: dependency-image cache key, and the greenfield check — and this module is
+#: the one with no heavy imports for them to pull in.
+MANIFEST_FILENAMES = (
+    "pyproject.toml",
+    "requirements.txt",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "Gemfile",
+    "pom.xml",
+    "build.gradle",
+    "Makefile",
+)
+
 #: Same hardening pattern as the old PythonAdapter.DOCKERFILE (non-root user,
 #: slim base) extended with a Node.js runtime. Pinned versions so the gate
 #: toolchain does not silently drift between runs.
+#:
+#: Node arrives by multi-stage copy rather than the usual
+#: `apt-get install curl gnupg` -> nodesource -> `apt-get install nodejs`
+#: chain. That chain made building the ONE image every gate run depends on
+#: contingent on three network services and a Debian mirror agreeing with
+#: each other; in practice a mirror serving an index whose hash did not match
+#: the package it then served (same filesize, different SHA) failed the build
+#: outright, and with it every `xeno run` on the machine. Copying from the
+#: official Node image needs no package manager at all, so there is nothing
+#: left to be stale. Both stages pin the same Debian release, which is what
+#: makes the copied binary's glibc match the base it lands on.
 DOCKERFILE = """\
-FROM python:3.11-slim
+FROM node:20-bookworm-slim AS node
+FROM python:3.11-slim-bookworm
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \\
+ && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 RUN pip install --no-cache-dir ruff==0.5.* mypy==1.10.* pytest==8.* pytest-cov==5.*
-RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-RUN apt-get install -y --no-install-recommends nodejs
-RUN apt-get purge -y curl gnupg && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 65532 --create-home --shell /usr/sbin/nologin xeno
 USER xeno
 WORKDIR /workspace
@@ -46,10 +77,20 @@ class DiscoveredCommand:
     — there is no fixed enum of phases, because not every ecosystem separates
     them the same way (a `go build` is parse+typecheck in one step; plain JS
     has no separate type-check phase at all).
+
+    `is_test` is the one classification the harness does need, and it is
+    DERIVED rather than declared: `xeno.adapters.discovery._classify` decides
+    it from the label and the argv on both the freshly-discovered and the
+    cached path. Deriving it keeps the on-disk cache format unchanged, so
+    every discovery file written before this field existed still loads.
     """
 
     name: str
     argv: tuple[str, ...]
+    #: Whether this command runs the repository's tests, and so must be held
+    #: back until the milestone it belongs to has tests to run (`xeno.core.
+    #: types.GateProfile`).
+    is_test: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,8 +111,49 @@ class DiscoveredToolchain:
     #: The manifest fingerprint this toolchain was discovered from
     #: (`xeno.adapters.discovery.manifest_fingerprint`) — stored alongside the
     #: commands so a loaded cache entry can be sanity-checked against the
-    #: fingerprint its filename encodes.
+    #: fingerprint its filename encodes. It is also the staleness key: a
+    #: mid-run write that changes a manifest makes this fingerprint no longer
+    #: match the worktree, which is what triggers re-discovery
+    #: (`xeno.graph.toolchain.ToolchainSession`).
     fingerprint: str
+
+    @classmethod
+    def unestablished(cls, fingerprint: str) -> DiscoveredToolchain:
+        """The greenfield case: a repository with no manifest, and therefore
+        nothing for the gates to run *yet*.
+
+        This is a real state, not an error and not an empty success. A run
+        may legitimately start here — the harness's own first task is then to
+        scaffold a toolchain into existence — but nothing may ever be
+        reported as *passing* against it, which is why `run_gates` refuses an
+        unestablished toolchain outright rather than falling through its
+        loops to a vacuous green (`xeno.graph.gates`).
+        """
+        return cls(install=None, required=(), advisory=(), fingerprint=fingerprint)
+
+    @property
+    def established(self) -> bool:
+        """True once there is at least one required command to gate on.
+
+        `required` being non-empty IS the definition — there is deliberately
+        no separate boolean that could drift out of sync with the command
+        list it describes.
+        """
+        return bool(self.required)
+
+    def required_for(self, profile: GateProfile) -> tuple[DiscoveredCommand, ...]:
+        """The required commands this profile runs, never an empty tuple.
+
+        A repository whose ONLY required command is its test command (`npm
+        test` and nothing else is a perfectly ordinary package.json) would
+        otherwise reduce to zero commands under `IMPLEMENTATION`, and a gate
+        chain that executes nothing reports a pass. Falling back to the full
+        list makes the degenerate case merely stricter than intended rather
+        than silently vacuous — the direction an error here has to fail in.
+        """
+        if profile is GateProfile.FULL:
+            return self.required
+        return tuple(c for c in self.required if not c.is_test) or self.required
 
 
 class GenericAdapter:

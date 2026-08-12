@@ -141,6 +141,7 @@ def make_argus_nodes(
                 builder=builder,
                 node=NodeRole.RESEARCHER,
                 state=state,
+                paths=paths,
                 current_turn=current_turn,
                 correction=ARGUS_FORMAT_CORRECTION,
                 parse=parse_argus_research_output,

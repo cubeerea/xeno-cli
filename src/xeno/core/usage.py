@@ -26,8 +26,18 @@ class Usage:
     output_tokens: int = 0
     cache_read_tokens: int = 0  # subset of input served from cache (discounted)
     cache_write_tokens: int = 0  # subset of input billed at the write premium
+    #: Subset of `output_tokens` the provider spent on hidden reasoning. Billed
+    #: as output and never present in the response text, so a node can appear
+    #: to have written 2,473 tokens while sending back 636. Zero when the
+    #: provider does not report it, which is NOT the same as "did not reason".
+    reasoning_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if self.reasoning_tokens > self.output_tokens:
+            raise ValueError(
+                f"reasoning tokens ({self.reasoning_tokens}) exceed total output "
+                f"({self.output_tokens}); the provider adapter is misreporting"
+            )
         if self.cache_read_tokens + self.cache_write_tokens > self.input_tokens:
             raise ValueError(
                 f"cached tokens ({self.cache_read_tokens} read + "

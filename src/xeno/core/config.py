@@ -99,10 +99,17 @@ class Limits(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    max_usd_per_run: float = Field(default=2.00, gt=0)
-    max_runtime_minutes: float = Field(default=45.0, gt=0)
-    max_iterations_per_task: int = Field(default=12, gt=0)
-    max_iterations_per_run: int = Field(default=60, gt=0)
+    #: Sized for building a project, not for patching one. The original
+    #: values ($2, 45 min, 12/task, 60/run) were set against XENO-SUITE-30's
+    #: single-file and multi-file tasks; a greenfield run plans a scaffold
+    #: task plus one task per feature and exhausts a 60-iteration run budget
+    #: long before it finishes. Every one of these is still a hard cap —
+    #: "unlimited" remains unexpressible — and every one is overridable in
+    #: `xeno.yaml`, which is where a cost-sensitive run should lower them.
+    max_usd_per_run: float = Field(default=10.00, gt=0)
+    max_runtime_minutes: float = Field(default=120.0, gt=0)
+    max_iterations_per_task: int = Field(default=25, gt=0)
+    max_iterations_per_run: int = Field(default=200, gt=0)
     max_rejections_per_run: int = Field(default=2, ge=0)
     max_deleted_lines: int = Field(default=200, gt=0)
 
@@ -213,6 +220,31 @@ class XenoConfig(BaseModel):
     allow_unpriced_models: bool = False
 
     source_path: Path | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_default_node_tiers(cls, data: Any) -> Any:
+        """Supply a default tier for any role the config does not name.
+
+        Every role still has to END UP with a tier — `_validate_node_tiers`
+        below is unchanged and still refuses a config that lacks one. What
+        this avoids is a config file becoming invalid because the HARNESS grew
+        a node: a user's working xeno.yaml should not start erroring the day
+        a seventh role is added, when there is a perfectly good default for it
+        sitting in `DEFAULT_NODE_TIERS`. An explicitly declared tier always
+        wins; this only fills gaps.
+        """
+        if not isinstance(data, dict):
+            return data
+        nodes = data.get("nodes")
+        if not isinstance(nodes, dict):
+            return data
+        declared = {NodeRole(k) if not isinstance(k, NodeRole) else k for k in nodes}
+        filled = dict(nodes)
+        for role, tier in DEFAULT_NODE_TIERS.items():
+            if role not in declared:
+                filled[role] = NodeSpec(tier=tier)
+        return {**data, "nodes": filled}
 
     @model_validator(mode="after")
     def _validate(self) -> Self:

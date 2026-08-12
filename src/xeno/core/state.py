@@ -17,7 +17,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from xeno.core.types import BreakerCode, Breakpoint, NodeRole, Tier, Verdict
+from xeno.core.types import BreakerCode, Breakpoint, GateProfile, NodeRole, Tier, Verdict
 
 #: PRD S6.3 HARD RULE: no AgentState field may exceed this serialized size.
 #: Anything larger is a Handle.
@@ -174,9 +174,31 @@ class AgentState(BaseModel):
     run_id: str
     goal: str
 
+    #: Odysseus's milestones (`xeno.graph.plan.Roadmap`): the coarse shape of
+    #: the build, written once before anything exists. Distinct from `plan`,
+    #: which Lachesis materializes one milestone at a time.
+    roadmap: Handle | None = None
+    milestone_cursor: int = 0
+    milestone_count: int = 0
+
+    #: The flat list of concrete tasks expanded SO FAR (`xeno.graph.plan.
+    #: Plan`). It grows as each milestone is expanded, so `task_count` is the
+    #: number of tasks known right now, never the number the run will end up
+    #: executing — that total is unknowable until the last milestone is
+    #: expanded, which is the point of expanding them one at a time.
     plan: Handle | None = None
     task_cursor: int = 0
     task_count: int = 0
+    #: Index into the plan at which the CURRENT milestone's tasks begin. The
+    #: plan is append-only within a milestone, so the slice from here to the
+    #: end is exactly the work Lachesis writes that milestone's tests against.
+    milestone_task_start: int = 0
+
+    #: Which gate set Talos runs on the next evaluation (`xeno.core.types.
+    #: GateProfile`). Implementation tasks gate on everything except the test
+    #: command — the tests for the milestone they belong to have not been
+    #: written yet — and a milestone's verification pass gates on everything.
+    gate_profile: GateProfile = GateProfile.IMPLEMENTATION
     context_handles: list[Handle] = Field(default_factory=list)
     diff_handle: Handle | None = None
     #: Rolling window of recent diffs' content hashes (PRD CB-5): a repeat
@@ -224,6 +246,15 @@ class AgentState(BaseModel):
 
     review_verdict: Verdict | None = None
     halt_reason: str | None = None
+    #: The raw text of a model exchange that never parsed (`xeno.graph.
+    #: nodeops`). The halt reason for a format failure is the PARSER's own
+    #: prose, which can say the response was unusable but not what it was —
+    #: this is the pointer that closes the gap, for the CLI's halt panel and
+    #: for Cerberus's escalation report. Set on failure and cleared on the
+    #: next successful parse, so it always describes the exchange behind the
+    #: CURRENT halt rather than some earlier node's slip that the corrective
+    #: retry already fixed.
+    unparsed_response: Handle | None = None
     breaker_trips: list[BreakerTrip] = Field(default_factory=list)
 
     #: Cerberus's full accumulated run diff (PRD S8.2), recomputed on every
@@ -251,6 +282,21 @@ class AgentState(BaseModel):
     #: Odysseus) clears it back to `None` immediately after, so a later,
     #: unrelated call to that same node can never misread a stale value.
     reject_destination: NodeRole | None = None
+
+    #: Lachesis's standing objection to the milestone at `milestone_cursor`:
+    #: prose saying why it could not be turned into buildable tasks. Set by
+    #: the expand job, read and cleared by Odysseus on the re-plan call — the
+    #: same set-then-consume discipline as `reject_destination`, and for the
+    #: same reason. Inline rather than a Handle, like `commit_message`: it is
+    #: a sentence or two, capped where it is set.
+    plan_objection: str | None = None
+    #: Objections raised CONSECUTIVELY, against
+    #: `xeno.graph.lachesis.MAX_PLAN_OBJECTIONS`; reset by any expansion that
+    #: succeeds. Its own budget rather than a ladder rung or `reject_count`: a
+    #: milestone that could not be expanded produced no code for the ladder to
+    #: act on and no diff for Cerberus to have reviewed, so neither of those
+    #: counters describes what happened.
+    plan_objection_count: int = 0
 
     @model_validator(mode="after")
     def _enforce_field_size(self) -> Self:

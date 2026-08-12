@@ -23,10 +23,17 @@ TIER_RANK: dict[Tier, int] = {Tier.LIGHT: 0, Tier.MEDIUM: 1, Tier.FLAGSHIP: 2}
 
 
 class NodeRole(StrEnum):
-    """The six nodes of the graph. Role is the primary name (PRD S1.1)."""
+    """The nodes of the graph. Role is the primary name (PRD S1.1)."""
 
     PLANNER = "planner"
     RESEARCHER = "researcher"
+    #: Turns one milestone into concrete tasks, then writes the tests that
+    #: prove it. Split out of PLANNER because the two decisions are knowable
+    #: at different times: the shape of the build is knowable up front, but
+    #: what a task should actually say — which module, which function, which
+    #: assertion — is only knowable once the preceding milestone's code
+    #: exists (`xeno.graph.plan`'s module docstring).
+    SPECIFIER = "specifier"
     CODER = "coder"
     EVALUATOR = "evaluator"
     DEBUGGER = "debugger"
@@ -36,6 +43,10 @@ class NodeRole(StrEnum):
 CALLSIGNS: dict[NodeRole, str] = {
     NodeRole.PLANNER: "Odysseus",
     NodeRole.RESEARCHER: "Argus",
+    #: One of the Moirai: the one who measures the thread and allots each
+    #: portion. This node allots the next increment of work and measures
+    #: whether it was achieved.
+    NodeRole.SPECIFIER: "Lachesis",
     NodeRole.CODER: "Daedalus",
     NodeRole.EVALUATOR: "Talos",
     NodeRole.DEBUGGER: "Chiron",
@@ -45,11 +56,35 @@ CALLSIGNS: dict[NodeRole, str] = {
 DEFAULT_NODE_TIERS: dict[NodeRole, Tier] = {
     NodeRole.PLANNER: Tier.FLAGSHIP,
     NodeRole.RESEARCHER: Tier.LIGHT,
+    #: Flagship for the same reason the planner is: this node decides what
+    #: "correct" means for every task and then writes the check for it, so a
+    #: cheap model here quietly lowers the bar the whole run is held to.
+    NodeRole.SPECIFIER: Tier.FLAGSHIP,
     NodeRole.CODER: Tier.MEDIUM,
     NodeRole.EVALUATOR: Tier.LIGHT,
     NodeRole.DEBUGGER: Tier.MEDIUM,
     NodeRole.REVIEWER: Tier.FLAGSHIP,
 }
+
+
+class GateProfile(StrEnum):
+    """Which of a repository's discovered commands an evaluation runs.
+
+    Exists because of the ordering problem tests create in a project being
+    built from nothing: a task cannot be gated on tests that describe code the
+    task has not written yet. So implementation tasks gate on everything the
+    toolchain offers EXCEPT its test command, and the milestone's own
+    verification pass — after Lachesis has written tests against code that now
+    exists — gates on all of it.
+
+    This never means "run nothing": `DiscoveredToolchain.required_for` falls
+    back to the full list rather than return an empty one, because a green
+    verdict from zero executed commands is the one outcome the gate chain must
+    never produce (`xeno.graph.gates`).
+    """
+
+    IMPLEMENTATION = "implementation"
+    FULL = "full"
 
 
 class Breakpoint(StrEnum):

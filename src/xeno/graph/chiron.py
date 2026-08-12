@@ -23,9 +23,12 @@ from xeno.graph.nodeops import (
     complete_with_format_retry,
     write_file_blocks,
 )
+from xeno.graph.plan import current_focus
 from xeno.graph.prompts import (
     CHIRON_FORMAT_CORRECTION,
+    CHIRON_REFUSED_PREFIX,
     CHIRON_SYSTEM,
+    CURRENT_TASK_PREFIX,
     parse_chiron_output,
 )
 from xeno.graph.testfiles import is_test_file
@@ -34,17 +37,40 @@ from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
 
 
-def _build_current_turn(state: AgentState) -> str:
+def _build_current_turn(state: AgentState, last_refusal: str) -> str:
     report = state.eval_report
     assert report is not None, "chiron is only ever entered after a Talos failure"
 
-    lines = [
-        f"Task: {state.goal}",
+    # `Task: {goal}` was a mislabel, not just an omission: the goal is the
+    # whole plan's destination, so calling it "the task" invited a patch
+    # scoped to the wrong thing entirely. The gates that just failed were
+    # evaluating the CURRENT task, so that is what a repair has to target.
+    lines = [f"Goal: {state.goal}"]
+
+    focus = current_focus(state)
+    if focus is not None:
+        lines += [
+            "",
+            CURRENT_TASK_PREFIX.format(
+                description=focus.description, acceptance=focus.acceptance
+            ),
+        ]
+
+    lines += [
         "",
         f"Evaluation failed: failed_command={report.failed_command!r}",
     ]
     if report.first_failure:
         lines.append(f"Critical failure detail: {report.first_failure}")
+
+    if last_refusal:
+        # Without this, a refused patch is invisible to the node that wrote
+        # it: the same patch gets proposed, refused, and re-proposed until
+        # the rung's budget is gone. Observed against a one-character lint
+        # fix — every attempt bundled a test file, every attempt was
+        # refused whole, and the actual fix never landed.
+        lines += ["", CHIRON_REFUSED_PREFIX, last_refusal]
+
     lines.append(
         "Diagnose the specific cause and apply the smallest patch that fixes it. Do "
         "not rewrite files wholesale — patch only the file(s) that need to change."
@@ -61,6 +87,7 @@ def make_chiron_node(
     worktree: Path,
     touched_files: list[Path],
     report_declined: Callable[[bool, str], None],
+    last_refusal: Callable[[], str],
 ) -> Callable[[AgentState], AgentState]:
     """Build the Chiron node.
 
@@ -92,7 +119,7 @@ def make_chiron_node(
         focus = [h.path for h in state.context_handles] or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
 
-        current_turn = _build_current_turn(state)
+        current_turn = _build_current_turn(state, last_refusal())
 
         try:
             output = complete_with_format_retry(
@@ -100,6 +127,7 @@ def make_chiron_node(
                 builder=builder,
                 node=NodeRole.DEBUGGER,
                 state=state,
+                paths=paths,
                 current_turn=current_turn,
                 correction=CHIRON_FORMAT_CORRECTION,
                 parse=parse_chiron_output,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -117,11 +118,34 @@ def test_local_models_need_no_price() -> None:
     assert config.flagship_is_local()
 
 
-def test_missing_node_tier_is_rejected() -> None:
-    with pytest.raises(ConfigError, match="no tier declared"):
+def test_an_undeclared_node_gets_its_default_tier() -> None:
+    """A working config must not start erroring the day the harness grows a
+    node. Every role still ends up with a tier — `_validate_node_tiers` is
+    unchanged — but the ones the user did not name are filled from
+    `DEFAULT_NODE_TIERS` rather than rejected."""
+    config = XenoConfig(
+        providers=_providers(),
+        tiers={t: (ModelSpec(provider="ollama", model="m"),) for t in Tier},
+        nodes={NodeRole.CODER: NodeSpec(tier=Tier.MEDIUM)},
+    )
+    assert set(config.nodes) == set(NodeRole)
+    assert config.tier_for(NodeRole.SPECIFIER) is DEFAULT_NODE_TIERS[NodeRole.SPECIFIER]
+
+
+def test_a_declared_tier_is_never_overridden_by_its_default() -> None:
+    config = XenoConfig(
+        providers=_providers(),
+        tiers={t: (ModelSpec(provider="ollama", model="m"),) for t in Tier},
+        nodes={NodeRole.SPECIFIER: NodeSpec(tier=Tier.LIGHT)},
+    )
+    assert config.tier_for(NodeRole.SPECIFIER) is Tier.LIGHT
+
+
+def test_a_node_declaring_a_tier_with_no_chain_is_still_rejected() -> None:
+    with pytest.raises(ConfigError, match="no chain defined"):
         XenoConfig(
             providers=_providers(),
-            tiers={t: (ModelSpec(provider="ollama", model="m"),) for t in Tier},
+            tiers={Tier.LIGHT: (ModelSpec(provider="ollama", model="m"),)},
             nodes={NodeRole.CODER: NodeSpec(tier=Tier.MEDIUM)},
         )
 
@@ -180,12 +204,29 @@ def test_secrets_denylist_is_extended_never_replaced() -> None:
 
 
 def test_limits_have_no_unlimited_default() -> None:
-    """PRD T5/CB-2: 'No "unlimited" default.'"""
+    """PRD T5/CB-2: 'No "unlimited" default.'
+
+    Asserts the invariant, not the specific numbers: the actual values are a
+    tuning decision (they were raised once already, when greenfield runs
+    turned out to plan far more tasks than a patch-shaped one), whereas
+    "every cap is finite and positive" is the property the PRD requires and
+    the one a regression here would actually be.
+    """
     limits = Limits()
-    assert limits.max_runtime_minutes == 45.0
-    assert limits.max_usd_per_run == 2.00
-    assert limits.max_iterations_per_task == 12
-    assert limits.max_rejections_per_run == 2
+    bounded = (
+        limits.max_usd_per_run,
+        limits.max_runtime_minutes,
+        limits.max_iterations_per_task,
+        limits.max_iterations_per_run,
+        limits.max_deleted_lines,
+    )
+    for value in bounded:
+        assert value > 0
+        assert math.isfinite(value)
+    # Rejections alone may legitimately be zero (never re-enter the loop),
+    # but must still be a real bound.
+    assert limits.max_rejections_per_run >= 0
+    assert math.isfinite(limits.max_rejections_per_run)
 
 
 # ---- ledger (PRD S15.1) ----------------------------------------------------

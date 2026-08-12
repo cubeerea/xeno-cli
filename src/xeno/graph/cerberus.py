@@ -60,6 +60,11 @@ def _deterministic_escalate_report(state: AgentState) -> str:
         f"Ladder rung reached: L{state.ladder_rung} (attempt {state.rung_attempts})",
         f"Task {state.task_cursor + 1} of {state.task_count}",
     ]
+    if state.unparsed_response is not None:
+        # Directly under the halt reason it explains. A report saying the
+        # response was unusable is not a lead until it says where the response
+        # is — and this report is the run's on-disk post-mortem.
+        lines.append(f"Raw unparseable response: {state.unparsed_response.path}")
     if state.breaker_trips:
         trips = "; ".join(f"{t.code.value}: {t.detail}" for t in state.breaker_trips)
         lines.append(f"Circuit breakers fired: {trips}")
@@ -134,6 +139,7 @@ def make_cerberus_node(
                 builder=builder,
                 node=NodeRole.REVIEWER,
                 state=state,
+                paths=paths,
                 current_turn=current_turn,
                 correction=CERBERUS_FORMAT_CORRECTION,
                 parse=parse_cerberus_output,

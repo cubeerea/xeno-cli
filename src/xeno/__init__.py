@@ -1,6 +1,6 @@
 """Xeno CLI - a terminal-native multi-agent coding harness.
 
-The agent layer is "The Mortal Forge": six nodes, each with a mythic callsign.
+The agent layer is "The Mortal Forge": seven nodes, each with a mythic callsign.
 Roles are primary; callsigns are shorthand (PRD S1.1).
 """
 

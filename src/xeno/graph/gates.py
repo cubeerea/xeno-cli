@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from xeno.adapters.generic import DiscoveredCommand, DiscoveredToolchain
+from xeno.core.types import GateProfile
 
 #: Generous but bounded — a command that never returns is worse than one
 #: that fails fast and lets CB-1 do its job. One budget for every discovered
@@ -50,6 +51,23 @@ class _Execable(Protocol):
     def exec(self, argv: Sequence[str], *, timeout: float) -> tuple[int, str]: ...
 
 
+#: What Talos reports when there is no toolchain to gate on. Named like a
+#: command so it flows through `EvalReport.failed_command`, the CB-4 failure
+#: signature, and Chiron's prompt exactly like any other gate failure.
+_NO_TOOLCHAIN_COMMAND = "toolchain-discovery"
+
+_NO_TOOLCHAIN_LOG = """\
+No toolchain is established for this repository: it declares no manifest or
+build file, so there is no lint, type-check, or test command to run, and
+nothing here can be verified.
+
+This is a code defect, not an infrastructure fault: the fix is to add the
+manifest that declares this project's dependencies and its lint/type-check/
+test configuration. Once a manifest exists, the toolchain is re-discovered
+automatically on the next evaluation.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class GateOutcome:
     passed: bool
@@ -60,11 +78,44 @@ class GateOutcome:
     exit_code: int | None
     infrastructure_failure: bool
     log: str = field(default="", repr=False)
+    #: Set when the failure is "there was nothing to run", as opposed to
+    #: something having run and failed. Distinct from `passed=False` alone so
+    #: a caller can tell a broken build from an absent one.
+    toolchain_unestablished: bool = False
 
 
-def run_gates(sandbox: _Execable, toolchain: DiscoveredToolchain) -> GateOutcome:
-    """Run `toolchain.required` in order (fail-fast), then `toolchain.
-    advisory` best-effort if every required command passed."""
+def run_gates(
+    sandbox: _Execable,
+    toolchain: DiscoveredToolchain,
+    *,
+    profile: GateProfile = GateProfile.FULL,
+) -> GateOutcome:
+    """Run this profile's required commands in order (fail-fast), then
+    `toolchain.advisory` best-effort if every one of them passed.
+
+    `profile` selects which required commands run, and only ever narrows the
+    list — see `DiscoveredToolchain.required_for`, which also guarantees the
+    narrowed list is never empty. Advisory commands are unaffected: they never
+    decide anything, so holding them back would only cost log detail.
+
+    An unestablished toolchain (no required commands at all) is a FAILURE,
+    never a pass. Falling through the loops below would otherwise return
+    `passed=True` having executed nothing — a silent green that would carry a
+    greenfield run all the way to Cerberus with every task "verified" by
+    zero commands. It is reported as an ordinary code defect rather than an
+    infrastructure fault on purpose: a missing manifest is something Chiron
+    can actually fix, so the ladder should engage instead of escalating.
+    """
+    if not toolchain.established:
+        return GateOutcome(
+            passed=False,
+            failed_command=_NO_TOOLCHAIN_COMMAND,
+            exit_code=1,
+            infrastructure_failure=False,
+            log=_NO_TOOLCHAIN_LOG,
+            toolchain_unestablished=True,
+        )
+
     log_chunks: list[str] = []
 
     def run(command: DiscoveredCommand, label: str) -> int:
@@ -72,7 +123,7 @@ def run_gates(sandbox: _Execable, toolchain: DiscoveredToolchain) -> GateOutcome
         log_chunks.append(f"---- {label} ----\n{output}")
         return exit_code
 
-    for command in toolchain.required:
+    for command in toolchain.required_for(profile):
         exit_code = run(command, command.name)
         if exit_code != 0:
             infrastructure = exit_code == _INFRASTRUCTURE_EXIT

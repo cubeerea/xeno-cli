@@ -1,13 +1,46 @@
-"""The full eight-node graph (PRD S13 Phase 3-4): Argus (skeleton) ->
-Odysseus (plan) -> [per task: Argus (research) -> Daedalus -> Talos ->
-escalation ladder] -> Cerberus -> done or reject-and-return.
+"""The full graph (PRD S13 Phase 3-4).
+
+Two nested loops. The outer one is the roadmap:
+
+    Argus (skeleton) -> Odysseus (roadmap)
+      -> per milestone: Lachesis (expand) -> [inner loop] -> Lachesis (verify)
+      -> Cerberus -> done or reject-and-return
+
+and the inner one is the plan Lachesis just expanded:
+
+    per task: Argus (research) -> Daedalus -> Talos -> escalation ladder
+
+The nesting exists because of WHEN things are knowable. Odysseus runs before
+any code exists, so it can only write coarse milestones; Lachesis runs
+immediately before each milestone, with the previous ones' code on disk, so
+it can write tasks that name real modules and functions. It then closes the
+milestone by writing that milestone's tests — the only node permitted to —
+and Talos runs the full gate set including the test command for the first
+time (`xeno.core.types.GateProfile`). Implementation tasks are gated on
+everything EXCEPT tests, because a task cannot be checked against tests
+describing code it has not written yet.
 
 The escalation ladder (PRD S7.2) is monotonic within a task
 (`AgentState.ladder_rung`'s docstring): L0 (re-run evaluation) -> L1 (Chiron
 patches, budget 3) -> L2 (Argus re-researches, then Chiron patches again,
-budget 2) -> L3 (roll back to the last checkpoint, Daedalus rewrites from
-scratch, budget 2) -> L4 (Odysseus re-plans the stuck task, then a single
-research-and-rewrite attempt) -> L5 (halt).
+budget 2) -> L3 (roll back to the last checkpoint and rewrite from scratch,
+budget 2) -> L4 (Lachesis re-expands the stuck task, then a single
+research-and-rewrite attempt) -> L5 (halt). L4 re-expands rather than
+re-plans because the task that got stuck is one Lachesis wrote; the roadmap
+above it is very rarely what was wrong.
+
+The ladder is about code that was written and failed. A milestone that could
+not be turned into tasks at all never reaches it: Lachesis objects, and the
+"replan" edge sends the objection back to Odysseus, who rewrites that
+milestone and everything after it (`MAX_PLAN_OBJECTIONS` bounds the cycle,
+and exhausting it halts to Cerberus like everything else). Together with a
+reviewer rejection those are the only two ways Odysseus is re-entered, and
+both arrive as another node's written objection over the milestones already
+built.
+
+Because Chiron may never touch a test file and Lachesis may write nothing
+else, a failing verification gate cannot be resolved by weakening the check:
+the ladder has no path to the test, so it is forced to fix the code.
 
 Cerberus is the sole human gate (PRD S8.1): every "halt" edge label in this
 graph, and `route_after_talos`'s "done" label, target the Cerberus node
@@ -27,7 +60,6 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from xeno.adapters.generic import GenericAdapter
 from xeno.core import vcs
 from xeno.core.breakers import (
     BreakerPanel,
@@ -38,18 +70,19 @@ from xeno.core.breakers import (
 from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths, run_branch_name
 from xeno.core.runlog import EventKind, RunLog
-from xeno.core.state import AgentState, Handle
-from xeno.core.types import RUNG_BUDGETS, LadderRung, NodeRole, Verdict
+from xeno.core.state import AgentState, EvalReport, Handle
+from xeno.core.types import RUNG_BUDGETS, GateProfile, LadderRung, NodeRole, Verdict
 from xeno.graph.argus import make_argus_nodes
 from xeno.graph.cerberus import make_cerberus_node
-from xeno.graph.checkpoints import checkpoint_step, rollback_step
+from xeno.graph.checkpoints import CheckpointKind, checkpoint_step, rollback_step
 from xeno.graph.chiron import make_chiron_node
 from xeno.graph.daedalus import make_daedalus_node
+from xeno.graph.lachesis import MAX_PLAN_OBJECTIONS, make_lachesis_nodes
 from xeno.graph.odysseus import make_odysseus_node
 from xeno.graph.talos import make_talos_node
+from xeno.graph.toolchain import ToolchainSession
 from xeno.prompt.keys import DEFAULT_IGNORES, CacheKeyring
 from xeno.router.router import Router
-from xeno.sandbox.pool import WarmPool
 
 _L0_RUNG = 0
 _L1_RUNG = 1
@@ -59,11 +92,29 @@ _L4_RUNG = 4
 _MAX_BUDGETED_RUNG = max(RUNG_BUDGETS)  # 4: L4 is the last rung with a budget; beyond it is L5/halt
 _RUNG_LABELS = tuple(rung.value for rung in LadderRung)  # index n -> "L{n}"
 
+#: How many times a write may be refused for touching a test file before the
+#: run halts. A refusal loops straight back to the writer with the reason
+#: attached, and nothing about it advances the ladder or a breaker's counters
+#: — so without a bound of its own, a model that will not stop bundling tests
+#: would loop forever.
+MAX_WRITE_REFUSALS = 3
+
 _RouteAfterTalos = Literal[
-    "retry_eval", "patch", "research_l2", "rollback_l3", "replan_l4", "next_task", "done", "halt"
+    "retry_eval",
+    "patch",
+    "research_l2",
+    "rollback_l3",
+    "reexpand_l4",
+    "next_task",
+    "verify",
+    "next_milestone",
+    "done",
+    "halt",
 ]
-_RouteAfterWrite = Literal["evaluate", "halt"]
-_RouteAfterOdysseus = Literal["research", "halt"]
+_RouteAfterWrite = Literal["evaluate", "retry", "halt"]
+_RouteAfterOdysseus = Literal["expand", "halt"]
+_RouteAfterExpand = Literal["research", "replan", "halt"]
+_RouteAfterRollback = Literal["daedalus", "verify"]
 _RouteAfterArgusSkeleton = Literal["plan", "halt"]
 _RouteAfterArgusResearch = Literal["daedalus", "chiron", "halt"]
 _RouteAfterCerberus = Literal["reject_daedalus", "reject_odysseus", "human"]
@@ -73,7 +124,7 @@ _ROUTE_BY_RUNG: dict[int, _RouteAfterTalos] = {
     _L1_RUNG: "patch",
     _L2_RUNG: "research_l2",
     _L3_RUNG: "rollback_l3",
-    _L4_RUNG: "replan_l4",
+    _L4_RUNG: "reexpand_l4",
 }
 
 
@@ -86,6 +137,14 @@ class _LoopContext:
         self.intervention = Intervention.NONE
         self.chiron_declined = False
         self.chiron_decline_reason = ""
+        self.chiron_refusal = ""
+        #: Daedalus bundled a test file into its response, so nothing was
+        #: written and the call has to be retried rather than evaluated.
+        self.daedalus_refused = False
+        self.daedalus_refusal = ""
+        self.daedalus_refusals = 0
+        #: The same, for Lachesis writing outside the test tree.
+        self.lachesis_refused = False
         #: For CB-6's illegal-removal check: what the worktree looked like
         #: after the previous write, and which paths were newly created
         #: SINCE THE START of this run (not merely since the last write).
@@ -100,6 +159,32 @@ class _LoopContext:
     def set_chiron_result(self, declined: bool, reason: str) -> None:
         self.chiron_declined = declined
         self.chiron_decline_reason = reason
+        # Only a REFUSED patch is worth replaying to Chiron. An ordinary
+        # decline ("I cannot form a hypothesis") is Chiron's own reasoned
+        # answer, and quoting it back would just invite it to repeat itself;
+        # a refusal is the harness overruling a patch it actually wrote, and
+        # is the one thing it otherwise has no way to find out about.
+        self.chiron_refusal = reason if declined and reason.startswith("patch touched") else ""
+
+    def take_refusal(self) -> str:
+        """Read-and-clear: a refusal describes the immediately preceding
+        attempt, so replaying it into a later, unrelated call would be
+        misleading rather than helpful."""
+        refusal, self.chiron_refusal = self.chiron_refusal, ""
+        return refusal
+
+    def set_daedalus_result(self, refused: bool, reason: str) -> None:
+        self.daedalus_refused = refused
+        if refused:
+            self.daedalus_refusal = reason
+            self.daedalus_refusals += 1
+
+    def take_daedalus_refusal(self) -> str:
+        refusal, self.daedalus_refusal = self.daedalus_refusal, ""
+        return refusal
+
+    def set_lachesis_result(self, refused: bool) -> None:
+        self.lachesis_refused = refused
 
     def set_skeleton(self, handle: Handle) -> None:
         self.skeleton_handle = handle
@@ -130,8 +215,7 @@ def build_graph(
     paths: RunPaths,
     worktree: Path,
     runlog: RunLog,
-    pool: WarmPool,
-    adapter: GenericAdapter,
+    session: ToolchainSession,
     goal: str,
     repo_root: Path,
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
@@ -169,6 +253,16 @@ def build_graph(
         paths=paths,
         skeleton=ctx.get_skeleton,
     )
+    lachesis_expand, lachesis_verify = make_lachesis_nodes(
+        router=router,
+        config=config,
+        keyring=keyring,
+        paths=paths,
+        worktree=worktree,
+        touched_files=touched_files,
+        toolchain_established=lambda: session.toolchain.established,
+        report_refused=ctx.set_lachesis_result,
+    )
     daedalus = make_daedalus_node(
         router=router,
         config=config,
@@ -176,6 +270,8 @@ def build_graph(
         paths=paths,
         worktree=worktree,
         touched_files=touched_files,
+        report_refused=ctx.set_daedalus_result,
+        last_refusal=ctx.take_daedalus_refusal,
     )
     chiron = make_chiron_node(
         router=router,
@@ -185,6 +281,7 @@ def build_graph(
         worktree=worktree,
         touched_files=touched_files,
         report_declined=ctx.set_chiron_result,
+        last_refusal=ctx.take_refusal,
     )
     talos = make_talos_node(
         router=router,
@@ -193,8 +290,7 @@ def build_graph(
         paths=paths,
         worktree=worktree,
         touched_files=touched_files,
-        pool=pool,
-        adapter=adapter,
+        session=session,
         breaker_panel=breaker_panel,
         runlog=runlog,
         intervention=lambda: ctx.intervention,
@@ -251,14 +347,53 @@ def build_graph(
         def step(state: AgentState) -> AgentState:
             runlog.event(EventKind.NODE_ENTER, node=name)
             state = fn(state)
-            runlog.event(EventKind.NODE_EXIT, node=name, halted=state.halted)
+            runlog.event(
+                EventKind.NODE_EXIT,
+                node=name,
+                halted=state.halted,
+                detail=_node_detail(name, state),
+            )
             return state
 
         return step
 
+    def _node_detail(name: str, state: AgentState) -> str:
+        """A one-line summary of what a node actually produced.
+
+        Lives here rather than inside each node because this is where the
+        post-node state and `touched_files` are both in scope, so no node
+        has to grow a reporting responsibility to make a run readable. Kept
+        to facts already in state — a summary that could disagree with the
+        run log would be worse than no summary.
+        """
+        if state.halted:
+            return state.halt_reason or "halted"
+        if name == "odysseus":
+            return f"{state.milestone_count} milestone(s) mapped"
+        if name == "lachesis_expand":
+            if state.plan_objection:
+                # Checked first: an objection produced no tasks, so the task
+                # counts below still describe the PREVIOUS milestone and the
+                # row would read as a successful expansion of this one.
+                return (
+                    f"objected to milestone {state.milestone_cursor + 1} "
+                    f"({state.plan_objection_count}/{MAX_PLAN_OBJECTIONS}); back to odysseus"
+                )
+            remaining = state.task_count - state.milestone_task_start
+            return f"milestone {state.milestone_cursor + 1}: {remaining} task(s)"
+        if name in ("daedalus", "chiron", "lachesis_verify"):
+            if not touched_files:
+                return ""
+            names = ", ".join(sorted(p.name for p in touched_files))
+            return f"wrote {names}"
+        if name == "argus_research":
+            return f"{len(state.context_handles)} file(s) in context"
+        return ""
+
     argus_skeleton_step = _node_step("argus_skeleton", argus_skeleton)
     odysseus_step = _node_step("odysseus", odysseus)
     argus_research_step = _node_step("argus_research", argus_research)
+    lachesis_expand_step = _node_step("lachesis_expand", lachesis_expand)
 
     def cerberus_step(state: AgentState) -> AgentState:
         runlog.event(EventKind.NODE_ENTER, node="cerberus")
@@ -281,11 +416,42 @@ def build_graph(
     def daedalus_step(state: AgentState) -> AgentState:
         runlog.event(EventKind.NODE_ENTER, node="daedalus")
         state = daedalus(state)
-        if not state.halted:
+        if not state.halted and not ctx.daedalus_refused:
             _after_write(state)
-        if not state.halted:
-            ctx.intervention = Intervention.MODEL_AUTHORED
-        runlog.event(EventKind.NODE_EXIT, node="daedalus", halted=state.halted)
+            if not state.halted:
+                ctx.intervention = Intervention.MODEL_AUTHORED
+        if ctx.daedalus_refused and ctx.daedalus_refusals >= MAX_WRITE_REFUSALS:
+            state.halt_reason = (
+                f"daedalus: {ctx.daedalus_refusals} responses in a row included a test file "
+                f"(last: {ctx.daedalus_refusal or 'see log'}); tests are Lachesis's to write"
+            )
+        runlog.event(
+            EventKind.NODE_EXIT,
+            node="daedalus",
+            halted=state.halted,
+            declined=ctx.daedalus_refused,
+            decline_reason=ctx.daedalus_refusal if ctx.daedalus_refused else "",
+        )
+        return state
+
+    def lachesis_verify_step(state: AgentState) -> AgentState:
+        runlog.event(EventKind.NODE_ENTER, node="lachesis_verify")
+        state = lachesis_verify(state)
+        if not state.halted and not ctx.lachesis_refused:
+            _after_write(state)
+            if not state.halted:
+                # A milestone's tests are as much a model-authored change as
+                # a patch is, and CB-4 has to see them that way: a failure
+                # signature surviving a fresh test suite is exactly the kind
+                # of no-progress loop it exists to stop.
+                ctx.intervention = Intervention.MODEL_AUTHORED
+        runlog.event(
+            EventKind.NODE_EXIT,
+            node="lachesis_verify",
+            halted=state.halted,
+            declined=ctx.lachesis_refused,
+            detail=_node_detail("lachesis_verify", state) if not ctx.lachesis_refused else "",
+        )
         return state
 
     def chiron_step(state: AgentState) -> AgentState:
@@ -316,16 +482,27 @@ def build_graph(
         # no-op silently discarded on the next hop.
         runlog.event(EventKind.NODE_ENTER, node="talos")
         state = talos(state)
-        passed = state.eval_report.passed if state.eval_report else None
-        runlog.event(EventKind.NODE_EXIT, node="talos", passed=passed)
+        report = state.eval_report
+        passed = report.passed if report else None
+        runlog.event(
+            EventKind.NODE_EXIT,
+            node="talos",
+            passed=passed,
+            failed_command=report.failed_command if report else "",
+            detail=_talos_detail(report),
+        )
         if passed:
-            checkpoint_step(state, worktree, router.ledger)
+            kind = checkpoint_step(state, worktree, router.ledger)
             runlog.event(
-                EventKind.CHECKPOINT,
+                EventKind.MILESTONE if kind is CheckpointKind.MILESTONE else EventKind.CHECKPOINT,
+                # Not `kind=`: that is `RunLog.event`'s own first parameter.
+                checkpoint_kind=kind.value,
                 task_index=state.checkpoints[-1].task_index,
                 sha=state.checkpoints[-1].sha,
                 task_cursor=state.task_cursor,
                 task_count=state.task_count,
+                milestone_cursor=state.milestone_cursor,
+                milestone_count=state.milestone_count,
             )
         elif not state.halted:
             _advance_ladder(state)
@@ -395,8 +572,48 @@ def build_graph(
         """Pure read of state the write step already committed. No mutation."""
         return "halt" if state.halted else "evaluate"
 
+    def route_after_daedalus(state: AgentState) -> _RouteAfterWrite:
+        """A refused write must NOT fall through to an evaluation.
+
+        Nothing was written, so the worktree still holds the previous task's
+        green state — Talos would pass it and `checkpoint_step` would commit a
+        task that implemented nothing. Looping back is the only safe edge, and
+        `MAX_WRITE_REFUSALS` (enforced in `daedalus_step`) is what stops it
+        being an infinite one.
+        """
+        if state.halted:
+            return "halt"
+        return "retry" if ctx.daedalus_refused else "evaluate"
+
+    def route_after_lachesis_verify(state: AgentState) -> _RouteAfterWrite:
+        """Same reasoning as `route_after_daedalus`, one level up: a refused
+        verification wrote no tests, and evaluating anyway would pass the
+        milestone on the strength of tests that do not exist."""
+        if state.halted:
+            return "halt"
+        return "retry" if ctx.lachesis_refused else "evaluate"
+
     def route_after_odysseus(state: AgentState) -> _RouteAfterOdysseus:
-        return "halt" if state.halted else "research"
+        return "halt" if state.halted else "expand"
+
+    def route_after_expand(state: AgentState) -> _RouteAfterExpand:
+        """`halted` first, though the two cannot actually both be live:
+        `_object_to_roadmap` leaves `plan_objection` unset on the branch that
+        exhausts the budget, precisely so this does not have to encode which
+        one wins."""
+        if state.halted:
+            return "halt"
+        return "replan" if state.plan_objection else "research"
+
+    def route_after_rollback(state: AgentState) -> _RouteAfterRollback:
+        """L3 discards the current attempt; whoever authored it rewrites it.
+
+        During a milestone's verification that is Lachesis, not Daedalus.
+        Sending Daedalus instead would be actively wrong: the rollback has
+        just deleted the milestone's tests, so the full gate run that follows
+        would be evaluating source against a suite that no longer exists.
+        """
+        return "verify" if state.gate_profile is GateProfile.FULL else "daedalus"
 
     def route_after_argus_skeleton(state: AgentState) -> _RouteAfterArgusSkeleton:
         return "halt" if state.halted else "plan"
@@ -417,7 +634,15 @@ def build_graph(
         report = state.eval_report
         assert report is not None, "talos always sets eval_report before returning"
         if report.passed:
-            return "next_task" if state.task_cursor < state.task_count else "done"
+            if state.gate_profile is GateProfile.IMPLEMENTATION:
+                # Still inside a milestone. When its last task lands, the
+                # milestone is built but nothing has RUN it yet — the test
+                # command was held back from every one of those gate runs —
+                # so the next stop is Lachesis writing the tests that do.
+                return "next_task" if state.task_cursor < state.task_count else "verify"
+            # A full gate run just passed, tests included. `checkpoint_step`
+            # already advanced `milestone_cursor` past it.
+            return "next_milestone" if state.milestone_cursor < state.milestone_count else "done"
         return _ROUTE_BY_RUNG[state.ladder_rung]
 
     def route_after_cerberus(state: AgentState) -> _RouteAfterCerberus:
@@ -434,10 +659,12 @@ def build_graph(
     graph = StateGraph(AgentState)
     graph.add_node("argus_skeleton", argus_skeleton_step)
     graph.add_node("odysseus", odysseus_step)
+    graph.add_node("lachesis_expand", lachesis_expand_step)
     graph.add_node("argus_research", argus_research_step)
     graph.add_node("daedalus", daedalus_step)
     graph.add_node("chiron", chiron_step)
     graph.add_node("rollback", rollback_node)
+    graph.add_node("lachesis_verify", lachesis_verify_step)
     graph.add_node("talos", talos_step)
     graph.add_node("cerberus", cerberus_step)
 
@@ -446,7 +673,12 @@ def build_graph(
         "argus_skeleton", route_after_argus_skeleton, {"plan": "odysseus", "halt": "cerberus"}
     )
     graph.add_conditional_edges(
-        "odysseus", route_after_odysseus, {"research": "argus_research", "halt": "cerberus"}
+        "odysseus", route_after_odysseus, {"expand": "lachesis_expand", "halt": "cerberus"}
+    )
+    graph.add_conditional_edges(
+        "lachesis_expand",
+        route_after_expand,
+        {"research": "argus_research", "replan": "odysseus", "halt": "cerberus"},
     )
     graph.add_conditional_edges(
         "argus_research",
@@ -454,12 +686,21 @@ def build_graph(
         {"daedalus": "daedalus", "chiron": "chiron", "halt": "cerberus"},
     )
     graph.add_conditional_edges(
-        "daedalus", route_after_write, {"evaluate": "talos", "halt": "cerberus"}
+        "daedalus",
+        route_after_daedalus,
+        {"evaluate": "talos", "retry": "daedalus", "halt": "cerberus"},
     )
     graph.add_conditional_edges(
         "chiron", route_after_write, {"evaluate": "talos", "halt": "cerberus"}
     )
-    graph.add_edge("rollback", "daedalus")
+    graph.add_conditional_edges(
+        "lachesis_verify",
+        route_after_lachesis_verify,
+        {"evaluate": "talos", "retry": "lachesis_verify", "halt": "cerberus"},
+    )
+    graph.add_conditional_edges(
+        "rollback", route_after_rollback, {"daedalus": "daedalus", "verify": "lachesis_verify"}
+    )
     graph.add_conditional_edges(
         "talos",
         route_after_talos,
@@ -468,8 +709,10 @@ def build_graph(
             "patch": "chiron",
             "research_l2": "argus_research",
             "rollback_l3": "rollback",
-            "replan_l4": "odysseus",
+            "reexpand_l4": "lachesis_expand",
             "next_task": "argus_research",
+            "verify": "lachesis_verify",
+            "next_milestone": "lachesis_expand",
             "done": "cerberus",
             "halt": "cerberus",
         },
@@ -491,8 +734,7 @@ def run_graph(
     worktree: Path,
     runlog: RunLog,
     state: AgentState,
-    pool: WarmPool,
-    adapter: GenericAdapter,
+    session: ToolchainSession,
     repo_root: Path,
 ) -> AgentState:
     """Compile and run the graph to completion, returning the final state."""
@@ -503,8 +745,7 @@ def run_graph(
         paths=paths,
         worktree=worktree,
         runlog=runlog,
-        pool=pool,
-        adapter=adapter,
+        session=session,
         goal=state.goal,
         repo_root=repo_root,
     )
@@ -513,6 +754,36 @@ def run_graph(
     # knob — CB-1's much lower per-task/per-run caps fire first in practice.
     result = compiled.invoke(state, config={"recursion_limit": 1000})
     return result if isinstance(result, AgentState) else AgentState.model_validate(result)
+
+
+def _talos_detail(report: EvalReport | None) -> str:
+    """What the gates said, in one line. `first_failure` is already the
+    triaged <=500-char critical span (PRD S10), so there is nothing further
+    to summarize — only to shorten for a single terminal row."""
+    if report is None:
+        return ""
+    if report.passed:
+        return "all gates passed"
+    if report.infrastructure_failure:
+        return f"infrastructure failure in {report.failed_command or 'gates'}"
+    failed = report.failed_command or "gates"
+    excerpt = _first_meaningful_line(report.first_failure or "")
+    return f"{failed} failed — {excerpt}" if excerpt else f"{failed} failed"
+
+
+def _first_meaningful_line(text: str) -> str:
+    """The first line a reader would actually want.
+
+    Talos's triage is a model call, and models like to wrap an excerpt in a
+    markdown fence — so the literal first line is often "```python", which
+    tells a reader watching the live view nothing at all about why the gates
+    failed.
+    """
+    for raw in text.strip().splitlines():
+        line = raw.strip()
+        if line and not line.startswith("```"):
+            return line[:100]
+    return ""
 
 
 def _snapshot(worktree: Path) -> set[str]:

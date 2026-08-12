@@ -21,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from xeno.adapters.generic import GenericAdapter
 from xeno.core.breakers import BreakerPanel, Intervention, failure_signature, observe_failure
 from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
@@ -32,11 +31,11 @@ from xeno.graph.context import build_codebase_map
 from xeno.graph.gates import run_gates
 from xeno.graph.prompts import TALOS_TRIAGE_SYSTEM
 from xeno.graph.testfiles import is_test_file
+from xeno.graph.toolchain import ToolchainSession
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.delimit import as_data
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
-from xeno.sandbox.pool import WarmPool
 
 #: The triage call sees at most this much of the raw log — enough context for
 #: a light model to find the relevant excerpt without paying to re-read a
@@ -52,13 +51,20 @@ def make_talos_node(
     paths: RunPaths,
     worktree: Path,
     touched_files: list[Path],
-    pool: WarmPool,
-    adapter: GenericAdapter,
+    session: ToolchainSession,
     breaker_panel: BreakerPanel,
     runlog: RunLog,
     intervention: Callable[[], Intervention],
 ) -> Callable[[AgentState], AgentState]:
     """Build the Talos node.
+
+    `session` supplies the sandbox pool and the toolchain, and is asked to
+    re-derive both immediately before each evaluation. This node is the right
+    place for that check because it is the only point where the toolchain is
+    actually consumed: whatever Daedalus or Chiron just wrote is on disk now,
+    so if that write established or changed the project's build declaration,
+    this evaluation must gate on the new one rather than a snapshot taken
+    before the run started (`xeno.graph.toolchain`).
 
     `intervention` is a callable rather than a fixed value because the same
     node instance is reused across the run's whole failure loop, and what
@@ -86,12 +92,18 @@ def make_talos_node(
         nonlocal call_index
         call_index += 1
 
-        sandbox = pool.acquire()
+        # Before the gates, not after: a write that added a manifest (the
+        # greenfield scaffold) or a dependency has to change what gets run
+        # THIS evaluation, or the ladder spends its budget on a toolchain
+        # that no longer describes the worktree.
+        session.refresh_if_stale(state)
+
+        sandbox = session.pool.acquire()
         try:
             sandbox.sync_worktree(worktree, secrets=config.secrets)
-            outcome = run_gates(sandbox, adapter.toolchain)
+            outcome = run_gates(sandbox, session.toolchain, profile=state.gate_profile)
         finally:
-            pool.release(sandbox)
+            session.pool.release(sandbox)
 
         log_path = paths.workspace / f"talos_log_{call_index}.txt"
         log_path.write_text(outcome.log)

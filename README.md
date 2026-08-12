@@ -12,14 +12,26 @@ before anything touches your working tree.
 Most agent harnesses fail by looping. This one is built to notice and halt.
 
 ```
-  Argus ──▶ Odysseus ──▶ Argus ──▶ Daedalus ──▶ Talos ──┬─▶ checkpoint ─▶ Cerberus ─▶ you
- skeleton     plan      research     write      gates   │                  review
-                           ▲                            │
-                           └────── Chiron ◀─────────────┘
-                                   patch    (bounded ladder: L0…L5)
+  Argus  ─▶  Odysseus  ─▶  Lachesis
+ skeleton     roadmap       expand
+                              │
+   ┌──── once per milestone ──┘
+   ▼
+  Argus  ─▶  Daedalus  ─▶  Talos  ─┬─▶  ckpt  ─▶  Lachesis  ─▶  Cerberus  ─▶  you
+ research      write       gates   │              verify         review
+   ▲                               │
+   └────── Chiron ◀────────────────┘
+          patch   (bounded ladder: L0…L5)
 ```
 
-**Status:** release v1 complete — all six nodes, sandboxed gates, the
+Two nested loops, because the work is knowable at two different times.
+Odysseus maps the goal into coarse **milestones** before any code exists.
+Lachesis expands one milestone into concrete tasks immediately before it is
+built — with the previous milestones already on disk, so it names real
+modules instead of guessing at them — and closes the milestone by writing the
+tests that prove it.
+
+**Status:** release v1 complete — all seven nodes, sandboxed gates, the
 escalation ladder, checkpoints, the git layer, and the human gate are
 implemented and wired. Built from `XenoCLI-PRD-v2.2.txt`; section references
 throughout the code point back at it.
@@ -65,8 +77,9 @@ Roles are primary; callsigns are shorthand used in logs and output.
 
 | Role | Callsign | Tier | Does |
 | --- | --- | --- | --- |
-| Planner | Odysseus | flagship | Decomposes the goal into verifiable tasks |
+| Planner | Odysseus | flagship | Maps the goal into coarse milestones, once, up front |
 | Researcher | Argus | light | Returns exactly the context others need, as handles |
+| Specifier | Lachesis | flagship | Expands the next milestone into tasks; writes its tests |
 | Coder | Daedalus | medium | Implements the current plan task |
 | Evaluator | Talos | light | Runs the discovered gate commands; reports exit codes |
 | Debugger | Chiron | medium | Diagnoses a specific failure and patches it |
@@ -74,7 +87,10 @@ Roles are primary; callsigns are shorthand used in logs and output.
 
 Separation of powers is load-bearing: the nodes that write code (Daedalus,
 Chiron) have no shell access, so the node that writes code does not get to
-declare it working. Talos's verdict is decided entirely by process exit codes
+declare it working. It cuts the other way too — Lachesis is the *only* node
+allowed to write a test file, and Daedalus and Chiron are refused any
+response that touches one. A failing test therefore has no path to being
+weakened; the ladder can only fix the code. Talos's verdict is decided entirely by process exit codes
 in plain Python — its single model call only compresses a failure log into a
 ≤500-character excerpt and can never flip a pass into a fail.
 
@@ -133,10 +149,14 @@ xeno run "add a --priority filter to the list command"
 ```
 
 The run copies your repo into `.xeno/worktrees/<run_id>/` and works only
-there. In order: Odysseus writes a plan; then for each task Argus selects
-context, Daedalus writes code, and Talos runs the gates in a container. Each
-green task is checkpointed as a commit. When the plan is done, Cerberus
-reviews the whole accumulated diff.
+there. In order: Odysseus maps out milestones; Lachesis expands the next one
+into tasks; then for each task Argus selects context, Daedalus writes code,
+and Talos runs the gates in a container. Each green task is checkpointed as a
+commit. When a milestone's tasks are done, Lachesis writes its tests and the
+gates run in full — implementation tasks are gated on everything *except* the
+test command, since a task cannot be checked against tests describing code it
+has not written yet. When the last milestone is verified, Cerberus reviews
+the whole accumulated diff.
 
 Useful flags:
 
@@ -176,7 +196,7 @@ ladder and stops:
 | **L1** | Chiron patches the specific failure |
 | **L2** | Argus re-researches — the context was probably wrong |
 | **L3** | Roll back to the last checkpoint and rewrite |
-| **L4** | Odysseus re-plans |
+| **L4** | Lachesis re-expands the milestone around the stuck task |
 | **L5** | Halt and escalate to a human |
 
 Six circuit breakers cut across the ladder and can halt a run at any rung:
@@ -247,6 +267,7 @@ tiers:
 nodes:
   planner:    {tier: flagship, max_tokens: 32000}   # Odysseus
   researcher: {tier: light}                         # Argus
+  specifier:  {tier: flagship, max_tokens: 32000}   # Lachesis
   coder:      {tier: medium}                        # Daedalus
   evaluator:  {tier: light}                         # Talos
   debugger:   {tier: medium}                        # Chiron
@@ -327,7 +348,7 @@ off if you would rather not pay the probe.
 | Layer | Choice |
 | --- | --- |
 | Language | Python 3.11+ |
-| Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) — the six-node state machine and its conditional edges |
+| Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) — the state machine and its conditional edges |
 | CLI | [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/) for tables, panels, and the review pager |
 | Data model | [Pydantic v2](https://docs.pydantic.dev/) — `AgentState`, config schema, and the 4 KB per-field limit |
 | Config | YAML via PyYAML, validated on load |

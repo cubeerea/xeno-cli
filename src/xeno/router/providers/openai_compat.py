@@ -84,7 +84,7 @@ class OpenAICompatProvider(Provider):
             self.chat_path,
             self.build_payload(prompt, model, max_tokens=max_tokens, temperature=temperature),
         )
-        text = _extract_text(body, provider=self.name)
+        text, reasoning, finish_reason = _extract_message(body, provider=self.name)
         usage = parse_openai_usage(body.get("usage") or {})
         return CompletionResult(
             text=text,
@@ -92,6 +92,8 @@ class OpenAICompatProvider(Provider):
             usage=usage,
             latency_ms=latency_ms,
             by_breakpoint=attribute_cache_to_breakpoints(prompt, usage),
+            finish_reason=finish_reason,
+            reasoning=reasoning,
         )
 
     def health_check(self) -> tuple[bool, str]:
@@ -171,6 +173,9 @@ def parse_openai_usage(raw: dict[str, Any]) -> Usage:
         or 0
     )
 
+    completion_details = raw.get("completion_tokens_details") or {}
+    reasoning = min(int(completion_details.get("reasoning_tokens") or 0), completion_tokens)
+
     cached = min(cached, prompt_tokens)
     written = min(written, prompt_tokens - cached)
     return Usage(
@@ -178,10 +183,42 @@ def parse_openai_usage(raw: dict[str, Any]) -> Usage:
         output_tokens=completion_tokens,
         cache_read_tokens=cached,
         cache_write_tokens=written,
+        reasoning_tokens=reasoning,
     )
 
 
-def _extract_text(body: dict[str, Any], *, provider: str) -> str:
+def _text_of(value: Any) -> str:
+    """OpenAI-shaped content: a bare string, or a list of typed parts."""
+    if isinstance(value, list):  # multipart response
+        return "".join(part.get("text", "") for part in value if isinstance(part, dict))
+    return str(value or "")
+
+
+def _reasoning_of(message: dict[str, Any]) -> str:
+    """A reasoning model's scratchpad, which arrives OUTSIDE `content` under a
+    field name that varies: OpenRouter normalizes to `reasoning` plus a
+    structured `reasoning_details`, while several upstreams send
+    `reasoning_content`.
+
+    Read because dropping it is invisible in the worst way — the tokens are
+    billed as output, so the run log shows a large response while the parser
+    is handed a small one, and nothing explains the gap.
+    """
+    for key in ("reasoning", "reasoning_content"):
+        text = _text_of(message.get(key))
+        if text:
+            return text
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        return "".join(
+            str(entry.get("text") or entry.get("summary") or "")
+            for entry in details
+            if isinstance(entry, dict)
+        )
+    return ""
+
+
+def _extract_message(body: dict[str, Any], *, provider: str) -> tuple[str, str, str | None]:
     choices = body.get("choices") or []
     if not choices:
         error = body.get("error")
@@ -190,11 +227,10 @@ def _extract_text(body: dict[str, Any], *, provider: str) -> str:
             provider=provider,
             retryable=True,
         )
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, list):  # multipart response
-        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return str(content or "")
+    choice = choices[0]
+    message = choice.get("message") or {}
+    finish = choice.get("finish_reason") or choice.get("native_finish_reason")
+    return _text_of(message.get("content")), _reasoning_of(message), finish
 
 
 __all__ = [

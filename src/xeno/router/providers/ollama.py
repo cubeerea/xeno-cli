@@ -74,6 +74,11 @@ class OllamaProvider(Provider):
             usage=usage,
             latency_ms=latency_ms,
             by_breakpoint=attribute_cache_to_breakpoints(prompt, usage),
+            # Local models think too: Ollama reports "length" here when
+            # num_predict was hit, and puts a reasoning model's scratchpad in
+            # `thinking` rather than `content`.
+            finish_reason=str(body.get("done_reason") or "") or None,
+            reasoning=str(message.get("thinking") or ""),
         )
 
     def health_check(self) -> tuple[bool, str]:

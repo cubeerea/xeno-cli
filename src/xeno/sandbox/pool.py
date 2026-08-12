@@ -37,7 +37,7 @@ import docker
 from docker.errors import DockerException, ImageNotFound
 from docker.models.containers import Container
 
-from xeno.adapters.generic import GenericAdapter
+from xeno.adapters.generic import MANIFEST_FILENAMES, GenericAdapter
 from xeno.core.config import SandboxConfig, SecretsConfig
 from xeno.sandbox.profile import WORKSPACE_MOUNT, container_kwargs, install_container_kwargs
 from xeno.security.mounts import mount_ignore
@@ -315,8 +315,16 @@ def _run_install(
 
 
 def _deps_hash(worktree: Path) -> str:
+    """Cache key for the committed dependency image.
+
+    Covers every manifest the harness knows about, not just the two Python
+    ones this used to check: a Node or Go repo hashed nothing at all, so
+    every such repo on a given Docker daemon resolved to the SAME
+    `-installed-e3b0c44298fc1c14` tag and silently reused the first one's
+    committed dependencies.
+    """
     hasher = hashlib.sha256()
-    for name in ("requirements.txt", "pyproject.toml"):
+    for name in MANIFEST_FILENAMES:
         path = worktree / name
         if path.is_file():
             hasher.update(name.encode())

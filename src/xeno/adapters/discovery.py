@@ -22,8 +22,13 @@ import json
 import shlex
 from pathlib import Path
 
-from xeno.adapters.generic import DiscoveredCommand, DiscoveredToolchain
+from xeno.adapters.generic import (
+    MANIFEST_FILENAMES,
+    DiscoveredCommand,
+    DiscoveredToolchain,
+)
 from xeno.core.config import STATE_DIRNAME, XenoConfig
+from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
@@ -44,37 +49,89 @@ from xeno.router.router import ChainExhaustedError, Router
 #: never blow the prompt budget.
 _MAX_MANIFEST_BYTES = 8_000
 
-#: The files discovery looks for, both to fingerprint the repo's toolchain
-#: declaration and to show the model their actual content.
-MANIFEST_FILENAMES = (
-    "pyproject.toml",
-    "requirements.txt",
-    "package.json",
-    "Cargo.toml",
-    "go.mod",
-    "Gemfile",
-    "pom.xml",
-    "build.gradle",
-    "Makefile",
-)
+#: Re-exported from `xeno.adapters.generic`, which owns the list — discovery
+#: uses it both to fingerprint the repo's toolchain declaration and to show
+#: the model their actual content.
+__all__ = [
+    "MANIFEST_FILENAMES",
+    "DiscoveryError",
+    "discover_toolchain",
+    "has_manifests",
+    "load_cached_toolchain",
+    "manifest_fingerprint",
+    "save_toolchain",
+]
 
 #: Defense in depth on top of the sandbox's own hardening: a hallucinated or
 #: injected destructive command (`rm`, `curl`, `sudo`, ...) is rejected
-#: before it is ever written to the cache or executed.
+#: before it is ever written to the cache or executed. One entry per
+#: ecosystem named in `MANIFEST_FILENAMES` — each is the actual package
+#: manager/toolchain entry point for that ecosystem, never a build-backend
+#: or plugin name (e.g. Python's `hatchling`, `setuptools`, `poetry-core`),
+#: since those are invoked *through* pip, not run directly.
 _ALLOWED_EXECUTABLES = frozenset(
     {
+        # Python
         "python3",
         "pip",
         "pytest",
         "ruff",
         "mypy",
+        # Node
         "node",
         "npm",
         "npx",
         "yarn",
         "pnpm",
+        # Rust
+        "cargo",
+        # Go
+        "go",
+        # Ruby
+        "bundle",
+        "gem",
+        "rspec",
+        # Java
+        "mvn",
+        "gradle",
+        "./gradlew",
+        # Make-based / language-agnostic
+        "make",
     }
 )
+
+
+#: Test runners recognizable from argv[0] alone.
+_TEST_ENTRYPOINTS = frozenset({"pytest", "rspec"})
+
+#: Tools whose test mode is a subcommand: `cargo test`, `go test`, `npm test`,
+#: `mvn test`, `gradle test`, `bundle exec rspec`, `npx jest`.
+_TEST_SUBCOMMANDS = frozenset({"test", "jest", "vitest", "mocha", "rspec"})
+
+
+def _classify(name: str, argv: tuple[str, ...]) -> bool:
+    """Whether a discovered command runs the repository's tests.
+
+    Two independent signals, because either one alone has a failure mode.
+    The label is what the model actually controls and JOB 3 asks it to use
+    the word "test" for, but a label is prose and prose drifts. The argv is
+    ground truth but has to be read positionally: scanning every token for
+    "test" would classify `mypy src tests` — which type-checks a directory
+    that happens to be called tests — as a test command, and then hold the
+    type checker back from every implementation gate.
+    """
+    if "test" in name.lower() or "spec" in name.lower():
+        return True
+    if not argv:
+        return False
+    if argv[0] in _TEST_ENTRYPOINTS:
+        return True
+    # Only the first two positions: `npm run test`, `bundle exec rspec`.
+    return any(token in _TEST_SUBCOMMANDS for token in argv[1:3])
+
+
+def _command(name: str, argv: tuple[str, ...]) -> DiscoveredCommand:
+    return DiscoveredCommand(name=name, argv=argv, is_test=_classify(name, argv))
 
 
 class DiscoveryError(Exception):
@@ -99,6 +156,20 @@ def manifest_fingerprint(worktree: Path) -> str:
     return hasher.hexdigest()[:16]
 
 
+def has_manifests(worktree: Path) -> bool:
+    """Whether this repository declares a toolchain at all.
+
+    The greenfield test, and deliberately a purely deterministic one: if no
+    manifest exists there is provably nothing for a model to discover, so the
+    unestablished result is reached without spending a call. Asking anyway
+    puts the model in an unsatisfiable position — JOB 3 forbids inventing a
+    toolchain that is not evidenced, while requiring at least one command —
+    and the likeliest answer is a hallucinated `pytest`/`npm test` that then
+    gates every task in the run against a command the repo never had.
+    """
+    return any((worktree / name).is_file() for name in MANIFEST_FILENAMES)
+
+
 def _cache_path(repo_root: Path, fingerprint: str) -> Path:
     return repo_root / STATE_DIRNAME / "discovery" / f"{fingerprint}.json"
 
@@ -106,7 +177,17 @@ def _cache_path(repo_root: Path, fingerprint: str) -> Path:
 def load_cached_toolchain(repo_root: Path, fingerprint: str) -> DiscoveredToolchain | None:
     """Returns `None` on anything short of a fully-formed match — a missing,
     corrupt, or stale-fingerprint cache file is just a cache miss, never an
-    error; the caller re-discovers."""
+    error; the caller re-discovers.
+
+    A *well-formed* cache entry that fails the executable allowlist is a
+    different matter and raises: this file is advertised as human-editable
+    (`save_toolchain`), so it is an input like any other, and skipping
+    `_validate` here would mean the allowlist this module presents as its
+    safety boundary could be bypassed simply by writing the command to disk
+    instead of having a model propose it. Loud beats silent — quietly
+    treating it as a miss would re-discover over the top and leave whoever
+    (or whatever) wrote it none the wiser.
+    """
     path = _cache_path(repo_root, fingerprint)
     if not path.is_file():
         return None
@@ -119,18 +200,15 @@ def load_cached_toolchain(repo_root: Path, fingerprint: str) -> DiscoveredToolch
     try:
         toolchain = DiscoveredToolchain(
             install=tuple(data["install"]) if data.get("install") else None,
-            required=tuple(
-                DiscoveredCommand(name=c["name"], argv=tuple(c["argv"]))
-                for c in data["required"]
-            ),
+            required=tuple(_command(c["name"], tuple(c["argv"])) for c in data["required"]),
             advisory=tuple(
-                DiscoveredCommand(name=c["name"], argv=tuple(c["argv"]))
-                for c in data.get("advisory", [])
+                _command(c["name"], tuple(c["argv"])) for c in data.get("advisory", [])
             ),
             fingerprint=fingerprint,
         )
     except (KeyError, TypeError):
         return None
+    _validate(toolchain, source=str(path))
     return toolchain
 
 
@@ -149,24 +227,28 @@ def save_toolchain(repo_root: Path, toolchain: DiscoveredToolchain) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def _validate(toolchain: DiscoveredToolchain) -> None:
+def _validate(toolchain: DiscoveredToolchain, *, source: str = "discovery") -> None:
+    """The executable allowlist boundary. Runs on BOTH paths a toolchain can
+    reach the sandbox by — freshly proposed by a model, and loaded from the
+    on-disk cache — since either one ends up as an argv executed in a
+    container. `source` names which, so the error says where to look."""
     if not toolchain.required:
-        raise DiscoveryError("discovery produced no required commands to gate on")
+        raise DiscoveryError(f"{source} produced no required commands to gate on")
     commands = (*toolchain.required, *toolchain.advisory)
     for command in commands:
         if not command.argv:
-            raise DiscoveryError(f"discovered command '{command.name}' has an empty argv")
+            raise DiscoveryError(f"{source}: command '{command.name}' has an empty argv")
         if command.argv[0] not in _ALLOWED_EXECUTABLES:
             raise DiscoveryError(
-                f"discovered command '{command.name}' proposed disallowed executable "
+                f"{source}: command '{command.name}' proposed disallowed executable "
                 f"'{command.argv[0]}' — allowed: {sorted(_ALLOWED_EXECUTABLES)}"
             )
     if toolchain.install is not None:
         if not toolchain.install:
-            raise DiscoveryError("discovered install command has an empty argv")
+            raise DiscoveryError(f"{source}: install command has an empty argv")
         if toolchain.install[0] not in _ALLOWED_EXECUTABLES:
             raise DiscoveryError(
-                f"discovered install command proposed disallowed executable "
+                f"{source}: install command proposed disallowed executable "
                 f"'{toolchain.install[0]}' — allowed: {sorted(_ALLOWED_EXECUTABLES)}"
             )
 
@@ -182,14 +264,8 @@ def _build_toolchain(output: DiscoveryOutput, fingerprint: str) -> DiscoveredToo
     install = _tokenize(output.install) if output.install else ()
     return DiscoveredToolchain(
         install=install or None,
-        required=tuple(
-            DiscoveredCommand(name=name, argv=_tokenize(argv_text))
-            for name, argv_text in output.required
-        ),
-        advisory=tuple(
-            DiscoveredCommand(name=name, argv=_tokenize(argv_text))
-            for name, argv_text in output.advisory
-        ),
+        required=tuple(_command(name, _tokenize(argv_text)) for name, argv_text in output.required),
+        advisory=tuple(_command(name, _tokenize(argv_text)) for name, argv_text in output.advisory),
         fingerprint=fingerprint,
     )
 
@@ -211,8 +287,10 @@ def discover_toolchain(
     config: XenoConfig,
     keyring: CacheKeyring,
     state: AgentState,
+    paths: RunPaths,
     repo_root: Path,
     worktree: Path,
+    allow_unestablished: bool = False,
 ) -> DiscoveredToolchain:
     """Cache lookup first; on a miss, one Argus JOB 3 call (`NodeRole.
     RESEARCHER`), validated and cached before being returned.
@@ -220,11 +298,31 @@ def discover_toolchain(
     Raises `DiscoveryError` if the model's chain is exhausted or its output
     stays malformed/unsafe after the standard corrective retry — there is
     nothing safe to gate a run on otherwise.
+
+    `allow_unestablished` covers the greenfield case: a repository with no
+    manifest at all resolves to `DiscoveredToolchain.unestablished` instead
+    of raising, letting a run start against an empty directory and scaffold
+    its own toolchain as its first task. The distinction matters — a repo
+    with manifests whose discovery fails is still a hard error, because
+    something IS declared there and we could not read it.
     """
     fingerprint = manifest_fingerprint(worktree)
     cached = load_cached_toolchain(repo_root, fingerprint)
     if cached is not None:
         return cached
+
+    if not has_manifests(worktree):
+        if not allow_unestablished:
+            raise DiscoveryError(
+                "no manifest or build file found at the repository root "
+                f"(looked for: {', '.join(MANIFEST_FILENAMES)}) — nothing to discover a "
+                "toolchain from"
+            )
+        # Deliberately NOT cached: "there is nothing here" is cheap to
+        # recompute, and every manifest-less repo shares one fingerprint, so
+        # writing it would persist a stale answer past the very first commit
+        # that establishes a toolchain.
+        return DiscoveredToolchain.unestablished(fingerprint)
 
     builder = PromptBuilder(
         node=NodeRole.RESEARCHER,
@@ -243,6 +341,7 @@ def discover_toolchain(
             builder=builder,
             node=NodeRole.RESEARCHER,
             state=state,
+            paths=paths,
             current_turn=current_turn,
             correction=DISCOVERY_FORMAT_CORRECTION,
             parse=parse_discovery_output,
@@ -251,9 +350,15 @@ def discover_toolchain(
         raise DiscoveryError(f"toolchain discovery: {exc}") from exc
 
     if output.malformed:
+        # The one caller that names the saved response itself: discovery runs
+        # BEFORE the graph, so its failure exits through the CLI's error path
+        # and never reaches the halt panel where every other node's saved
+        # response is reported from `state.unparsed_response`.
+        saved = state.unparsed_response
         raise DiscoveryError(
             "toolchain discovery produced no usable required-command list after "
             f"{MAX_FORMAT_ATTEMPTS} attempt(s)"
+            + (f"; raw response saved to {saved.path}" if saved is not None else "")
         )
 
     toolchain = _build_toolchain(output, fingerprint)

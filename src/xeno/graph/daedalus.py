@@ -27,28 +27,51 @@ from xeno.graph.nodeops import (
     complete_with_format_retry,
     write_file_blocks,
 )
+from xeno.graph.plan import current_focus
 from xeno.graph.prompts import (
+    CURRENT_TASK_PREFIX,
     DAEDALUS_CERBERUS_REJECTION_PREFIX,
     DAEDALUS_FORMAT_CORRECTION,
+    DAEDALUS_REFUSED_PREFIX,
     DAEDALUS_SYSTEM,
     parse_daedalus_output,
 )
+from xeno.graph.testfiles import is_test_file
 from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import ChainExhaustedError, Router
 
 
-def _build_current_turn(state: AgentState) -> str:
-    """Ordinary task work is just the goal. A Cerberus E16 REJECT_AND_RETURN
-    (PRD S8.3) appends the reviewer's objections instead — a fully green run
-    was rejected on implementation grounds, so this call is a targeted fix,
-    not a from-scratch implementation."""
-    if state.reject_destination is not NodeRole.CODER:
-        return state.goal
-    assert state.cerberus_notes is not None, "a CODER rejection always carries objections"
-    return "\n".join(
-        [state.goal, "", DAEDALUS_CERBERUS_REJECTION_PREFIX, state.cerberus_notes.read_text()]
-    )
+def _build_current_turn(state: AgentState, last_refusal: str) -> str:
+    """The goal plus the CURRENT plan task. A Cerberus E16 REJECT_AND_RETURN
+    (PRD S8.3) appends the reviewer's objections as well — a fully green run
+    was rejected on implementation grounds, so that call is a targeted fix,
+    not a from-scratch implementation.
+
+    The current task is what makes the plan real: `DAEDALUS_SYSTEM` tells
+    this node to "implement the current plan task", and until it was
+    actually supplied, the instruction pointed at nothing and every task in
+    the plan was implemented as the whole goal.
+    """
+    lines = [f"Goal: {state.goal}"]
+
+    focus = current_focus(state)
+    if focus is not None:
+        lines += [
+            "",
+            CURRENT_TASK_PREFIX.format(
+                description=focus.description, acceptance=focus.acceptance
+            ),
+        ]
+
+    if last_refusal:
+        lines += ["", DAEDALUS_REFUSED_PREFIX, last_refusal]
+
+    if state.reject_destination is NodeRole.CODER:
+        assert state.cerberus_notes is not None, "a CODER rejection always carries objections"
+        lines += ["", DAEDALUS_CERBERUS_REJECTION_PREFIX, state.cerberus_notes.read_text()]
+
+    return "\n".join(lines)
 
 
 def make_daedalus_node(
@@ -59,8 +82,19 @@ def make_daedalus_node(
     paths: RunPaths,
     worktree: Path,
     touched_files: list[Path],
+    report_refused: Callable[[bool, str], None],
+    last_refusal: Callable[[], str],
 ) -> Callable[[AgentState], AgentState]:
-    """Build the Daedalus node."""
+    """Build the Daedalus node.
+
+    `report_refused` mirrors Chiron's `report_declined`: this node decides
+    whether a response was refused for touching a test file, and the caller in
+    `xeno.graph.build` needs that decision after the node returns in order to
+    route back here rather than on to Talos. Falling through to an evaluation
+    after a refused write would be actively wrong, not merely wasteful — the
+    worktree still holds the previous task's green state, so the gates would
+    pass and checkpoint a task that wrote nothing.
+    """
     builder = PromptBuilder(
         node=NodeRole.CODER,
         keyring=keyring,
@@ -80,7 +114,7 @@ def make_daedalus_node(
         focus = [h.path for h in state.context_handles] or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
 
-        current_turn = _build_current_turn(state)
+        current_turn = _build_current_turn(state, last_refusal())
         state.reject_destination = None
 
         try:
@@ -89,6 +123,7 @@ def make_daedalus_node(
                 builder=builder,
                 node=NodeRole.CODER,
                 state=state,
+                paths=paths,
                 current_turn=current_turn,
                 correction=DAEDALUS_FORMAT_CORRECTION,
                 parse=parse_daedalus_output,
@@ -107,6 +142,15 @@ def make_daedalus_node(
             state.halt_reason = f"daedalus objection: {output.objection}"
             return state
 
+        test_hits = [b.path for b in output.files if is_test_file(Path(b.path).as_posix())]
+        if test_hits:
+            # Refused whole rather than partially applied. Writing "just the
+            # implementation half" of a response would land code shaped around
+            # a test that was silently dropped, and the node would never learn
+            # that half its answer disappeared (`xeno.graph.testfiles`).
+            report_refused(True, f"test file(s): {', '.join(test_hits)}")
+            return state
+
         try:
             written, diff_text = write_file_blocks(worktree, output.files)
         except WorktreeEscape as exc:
@@ -123,6 +167,7 @@ def make_daedalus_node(
             summary=f"daedalus call {call_index}: {', '.join(b.path for b in output.files)}",
         )
 
+        report_refused(False, "")
         return state
 
     return node

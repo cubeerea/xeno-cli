@@ -31,6 +31,46 @@ _DATA_BLOCK_OVERHEAD = len(as_data("", label="repository file", source="", trunc
 #: shares via `xeno.graph.nodeops.complete_with_format_retry`).
 _CONTENT_EXCLUDED_DIRS = frozenset({"tests", "tests_pending", "test"})
 
+#: Which files are worth spending context budget on. Deliberately an
+#: allowlist of source-and-config text, not "anything that decodes as UTF-8":
+#: the budget is small enough that one stray fixture or generated artifact
+#: can crowd out the file the model actually needs.
+#:
+#: This used to be `.py` alone, which quietly made the whole harness
+#: Python-only — `GenericAdapter` and toolchain discovery are language
+#: agnostic, but a Rust or TypeScript repo still handed Daedalus and Chiron a
+#: bare file tree with zero content, so they were writing blind against every
+#: language but one.
+_SOURCE_SUFFIXES = frozenset(
+    {
+        ".py", ".pyi",
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".svelte", ".vue",
+        ".rs", ".go", ".rb", ".java", ".kt", ".kts", ".scala", ".swift",
+        ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php",
+        ".sh", ".bash", ".sql", ".proto", ".graphql",
+        ".html", ".css", ".scss",
+        ".toml", ".json", ".yaml", ".yml", ".ini", ".cfg", ".md",
+    }
+)
+
+#: Lockfiles are machine-generated, enormous, and tell the model nothing it
+#: cannot read from the manifest beside them. They match `_SOURCE_SUFFIXES`
+#: by extension, so without this a `package-lock.json` sorting early in the
+#: walk would consume the entire content budget on its own.
+_LOCKFILE_NAMES = frozenset(
+    {
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "Cargo.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "uv.lock",
+    }
+)
+
 
 def _walk(root: Path, ignore: frozenset[str]) -> Iterable[Path]:
     for entry in sorted(root.iterdir()):
@@ -57,11 +97,11 @@ def build_codebase_map(
     named the relevant file(s) has already done Argus's job, and dumping the
     rest of the tree's content on top only spends context for no benefit.
 
-    Without `focus`, every Python file is a candidate, but content under a
-    test directory is skipped (still listed in the tree) since neither
-    Daedalus nor Chiron can run tests anyway, and the acceptance tests for
-    the task at hand would otherwise be handed to them as an answer key
-    alongside the codebase.
+    Without `focus`, every source or config file is a candidate (see
+    `_SOURCE_SUFFIXES`), but content under a test directory is skipped (still
+    listed in the tree) since neither Daedalus nor Chiron can run tests
+    anyway, and the acceptance tests for the task at hand would otherwise be
+    handed to them as an answer key alongside the codebase.
     """
     files = list(_walk(worktree, DEFAULT_IGNORES))
     lines = ["Repository file tree:"]
@@ -73,16 +113,22 @@ def build_codebase_map(
 
     budget = max_content_bytes
     for f in files:
-        if f.suffix != ".py" or budget <= 0:
+        if budget <= 0:
             continue
         if focus_resolved is not None:
+            # An explicit pick — Argus's or the user's `--file` — overrides
+            # the suffix allowlist: naming a file IS the argument for
+            # showing it, whatever it is called.
             if f.resolve() not in focus_resolved:
                 continue
-        elif any(part in _CONTENT_EXCLUDED_DIRS for part in f.relative_to(worktree).parts[:-1]):
-            continue
+        else:
+            if f.suffix not in _SOURCE_SUFFIXES or f.name in _LOCKFILE_NAMES:
+                continue
+            if any(part in _CONTENT_EXCLUDED_DIRS for part in f.relative_to(worktree).parts[:-1]):
+                continue
         try:
             text = f.read_text()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         rel = f.relative_to(worktree).as_posix()
         # PRD S11.4: repository files are untrusted input. Every retrieved

@@ -1,0 +1,54 @@
+# Xeno CLI configuration (PRD S9.5). Defaults target Hardware Tier 1
+# (Apple Silicon, 32 GB unified memory).
+#
+# Hardware Tier 0 (8 GB VRAM): set medium's first entry to an API provider.
+# A 14B local model will not fit. See PRD S9.3.
+
+tiers:
+  flagship:
+    - {provider: openrouter, model: z-ai/glm-5.2, usd_per_1m_input: 1.40, usd_per_1m_output: 2.20}
+  medium:
+    - {provider: ollama, model: "qwen2.5-coder:14b"}
+    # Upward fallback must be declared explicitly. It is logged and counted
+    # against M1.1 by the model actually billed (PRD S9.5).
+    - {provider: openrouter, model: z-ai/glm-5.2, escalation: true,
+       usd_per_1m_input: 1.40, usd_per_1m_output: 2.20}
+  light:
+    - {provider: ollama, model: "qwen2.5-coder:7b"}
+
+nodes:
+  planner:    {tier: flagship, max_tokens: 32000}   # Odysseus
+  researcher: {tier: light}                         # Argus
+  specifier:  {tier: flagship, max_tokens: 32000}   # Lachesis
+  coder:      {tier: medium}                        # Daedalus
+  evaluator:  {tier: light}                         # Talos
+  debugger:   {tier: medium}                        # Chiron
+  reviewer:   {tier: flagship, max_tokens: 32000}   # Cerberus
+
+limits:
+  max_usd_per_run: 10.00
+  max_runtime_minutes: 120
+  max_iterations_per_task: 25
+  max_iterations_per_run: 200
+  max_rejections_per_run: 2
+  max_deleted_lines: 200
+
+git:
+  branch_prefix: "xeno/"
+  squash_per_run: true   # v1 always squashes per-run (PRD OQ-4)
+  open_pr: false          # set true + install `gh` to open a PR on APPROVE
+
+caching:
+  enabled: true
+  probe_aggregators_at_startup: true
+
+sandbox:
+  network: none          # none | install | open  (PRD S11.2)
+  memory: 2g
+  cpus: 2
+  warm_pool_size: 2
+
+secrets:
+  # Appended to the built-in denylist; never replaces it.
+  extra_denylist: []
+  scan_outbound_context: true
