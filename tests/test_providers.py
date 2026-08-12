@@ -16,7 +16,7 @@ from xeno.core.usage import Usage
 from xeno.prompt.assembly import AssembledPrompt, Block, CacheTTL, Turn
 from xeno.router.pricing import price_call, uncached_price
 from xeno.router.providers import build_provider
-from xeno.router.providers.base import attribute_cache_to_breakpoints
+from xeno.router.providers.base import ProviderError, attribute_cache_to_breakpoints
 from xeno.router.providers.ollama import OllamaProvider, parse_ollama_usage
 from xeno.router.providers.openai_compat import (
     OpenAICompatProvider,
@@ -319,3 +319,176 @@ def test_reasoning_tokens_are_counted_as_the_output_subset_they_are() -> None:
 def test_a_provider_claiming_more_reasoning_than_output_is_rejected() -> None:
     with pytest.raises(ValueError, match="exceed total output"):
         Usage(output_tokens=10, reasoning_tokens=11)
+
+
+# ---- Ollama context window and residency -----------------------------------
+#
+# Ollama serves its own default window regardless of what the model supports
+# and silently discards the front of anything longer — which by ASSEMBLY_ORDER
+# is the system prompt. These pin the derivation that stops that happening,
+# and the release that stops the weights outliving the run.
+
+
+class _FakeDaemon:
+    """Routes by path, so /api/show and /api/chat can answer differently."""
+
+    def __init__(self, *, context_length: int | None = 32768) -> None:
+        self.context_length = context_length
+        self.chats: list[dict] = []
+        self.shows: list[dict] = []
+        self.unloads: list[dict] = []
+
+    def post(self, path: str, payload: dict) -> tuple[dict, float]:
+        if path == "/api/show":
+            self.shows.append(payload)
+            if self.context_length is None:
+                return {}, 1.0
+            return {"model_info": {"qwen2.context_length": self.context_length}}, 1.0
+        if payload.get("keep_alive") == 0:
+            self.unloads.append(payload)
+            return {}, 1.0
+        self.chats.append(payload)
+        return {"message": {"content": "ok"}, "prompt_eval_count": 500, "eval_count": 5}, 1.0
+
+
+def _wired(spec: ProviderSpec = OLLAMA, **kwargs) -> tuple[OllamaProvider, _FakeDaemon]:
+    provider = OllamaProvider("ollama", spec)
+    daemon = _FakeDaemon(**kwargs)
+    provider._post = daemon.post  # type: ignore[method-assign]
+    return provider, daemon
+
+
+def _big_prompt(chars: int) -> AssembledPrompt:
+    return AssembledPrompt(
+        node=NodeRole.SPECIFIER,
+        blocks=(
+            Block(breakpoint=Breakpoint.SYSTEM, text="S" * chars, ttl=CacheTTL.LONG),
+            Block(breakpoint=Breakpoint.CURRENT_TURN, text="go", ttl=CacheTTL.NONE),
+        ),
+        history=(),
+    )
+
+
+_MODEL = ModelSpec(provider="ollama", model="m")
+
+
+def test_num_ctx_is_sent_and_sized_to_the_prompt() -> None:
+    """Without this the daemon serves its own default — 4096 on the ones this
+    was built against — no matter what the model supports."""
+    provider, daemon = _wired()
+    # ~5000 prompt tokens at 4 chars/token, plus 2000 of generation room.
+    provider.complete(_big_prompt(20_000), _MODEL, max_tokens=2000)
+
+    assert daemon.chats[0]["options"]["num_ctx"] == 8192, "smallest bucket that fits"
+
+
+def test_the_window_is_clamped_to_what_the_model_reports() -> None:
+    provider, daemon = _wired(context_length=8192)
+    provider.complete(_big_prompt(20_000), _MODEL, max_tokens=2000)
+
+    assert daemon.chats[0]["options"]["num_ctx"] == 8192
+    assert daemon.shows, "the ceiling is discovered, not assumed"
+
+
+def test_the_window_never_steps_back_down() -> None:
+    """Shrinking would reload the weights to reclaim memory already spent,
+    and the next large prompt would reload them straight back."""
+    provider, daemon = _wired()
+    provider.complete(_big_prompt(40_000), _MODEL, max_tokens=2000)
+    provider.complete(_big_prompt(100), _MODEL, max_tokens=10)
+
+    first, second = (c["options"]["num_ctx"] for c in daemon.chats)
+    assert first == 16384
+    assert second == first, "a small follow-up must not trigger a reload"
+
+
+def test_the_discovered_ceiling_is_asked_for_once() -> None:
+    provider, daemon = _wired()
+    for _ in range(3):
+        provider.complete(_big_prompt(100), _MODEL, max_tokens=10)
+
+    assert len(daemon.shows) == 1
+
+
+def test_a_prompt_too_large_for_the_model_is_refused_not_truncated() -> None:
+    """The whole point: Ollama would take this call, discard the front of the
+    prompt, and answer confidently from what was left."""
+    provider, daemon = _wired(context_length=4096)
+
+    with pytest.raises(ProviderError) as excinfo:
+        provider.complete(_big_prompt(20_000), _MODEL, max_tokens=1000)
+
+    message = str(excinfo.value)
+    assert "4096" in message, "the ceiling the reader has to work around"
+    assert str(_big_prompt(20_000).approx_tokens) in message, "what the call actually needed"
+    assert "system prompt" in message
+    assert excinfo.value.retryable is False, "a bigger window will not appear on retry"
+    assert not daemon.chats, "nothing was sent"
+
+
+def test_a_daemon_that_will_not_report_a_ceiling_still_runs() -> None:
+    """Not knowing the limit is a reason to skip the clamp, not to refuse."""
+    provider, daemon = _wired(context_length=None)
+    provider.complete(_big_prompt(20_000), _MODEL, max_tokens=2000)
+
+    assert daemon.chats[0]["options"]["num_ctx"] == 8192
+
+
+def test_keep_alive_comes_from_the_provider_spec() -> None:
+    spec = ProviderSpec(family=ProviderFamily.OLLAMA, base_url="http://x", keep_alive="5m")
+    provider, daemon = _wired(spec)
+    provider.complete(make_prompt(), _MODEL, max_tokens=10)
+
+    assert daemon.chats[0]["keep_alive"] == "5m"
+
+
+def test_close_unloads_every_model_the_run_loaded() -> None:
+    """A timer cannot know a run ended, which is why the weights outlive it."""
+    provider, daemon = _wired()
+    provider.complete(make_prompt(), _MODEL, max_tokens=10)
+    provider.complete(make_prompt(), ModelSpec(provider="ollama", model="other"), max_tokens=10)
+    provider.close()
+
+    assert [u["model"] for u in daemon.unloads] == ["m", "other"]
+    assert all(u["keep_alive"] == 0 for u in daemon.unloads)
+
+
+def test_close_leaves_the_model_warm_when_asked_to() -> None:
+    spec = ProviderSpec(family=ProviderFamily.OLLAMA, base_url="http://x", release_on_exit=False)
+    provider, daemon = _wired(spec)
+    provider.complete(make_prompt(), _MODEL, max_tokens=10)
+    provider.close()
+
+    assert daemon.unloads == []
+
+
+def test_close_survives_a_daemon_that_has_already_gone_away() -> None:
+    """Teardown must not take a run's exit path down: the memory is reclaimed
+    by the daemon's own timer anyway."""
+    provider, _ = _wired()
+    provider.complete(make_prompt(), _MODEL, max_tokens=10)
+
+    def explode(path: str, payload: dict) -> tuple[dict, float]:
+        raise ProviderError("daemon gone", provider="ollama", retryable=False)
+
+    provider._post = explode  # type: ignore[method-assign]
+    provider.close()  # must not raise
+
+
+def test_an_evaluated_prompt_far_short_of_the_estimate_is_flagged() -> None:
+    """`prompt_eval_count` was always in the response and only ever used for
+    accounting. Comparing it against what was sent is what makes a window
+    overflow observable instead of silent."""
+    provider, _ = _wired()
+    result = provider.complete(_big_prompt(20_000), _MODEL, max_tokens=100)
+
+    # The fake reports 500 evaluated against a ~5000-token prompt.
+    assert result.prompt_truncated is True
+
+
+def test_a_normal_call_is_not_flagged_as_truncated() -> None:
+    provider, _ = _wired()
+    result = provider.complete(_big_prompt(2000), _MODEL, max_tokens=100)
+
+    # ~500 estimated, 500 evaluated: estimator drift, not truncation.
+    assert result.prompt_truncated is False

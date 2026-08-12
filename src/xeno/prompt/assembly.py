@@ -121,6 +121,20 @@ class AssembledPrompt:
         block = self.block(Breakpoint.CURRENT_TURN)
         return block.text if block else ""
 
+    @property
+    def approx_tokens(self) -> int:
+        """Cheap size estimate for the whole prompt, blocks plus history.
+
+        Same 4-chars-per-token rule as `Block.approx_tokens` and the same
+        caveat: never used for billing, only for the two decisions that must
+        be made BEFORE a call exists to measure — projecting its cost against
+        the budget breaker, and sizing the context window a local backend is
+        asked to allocate for it.
+        """
+        return sum(b.approx_tokens for b in self.blocks if b.text) + sum(
+            len(t.content) // 4 for t in self.history
+        )
+
     def prefix_signature(self) -> str:
         """Digest of everything ahead of the current turn.
 

@@ -32,7 +32,7 @@ from xeno.core.usage import Usage
 from xeno.prompt.assembly import AssembledPrompt
 from xeno.router.pricing import price_call, uncached_price
 from xeno.router.probe import ProbeResult, probe_provider, probe_targets
-from xeno.router.providers import Provider, ProviderError, build_provider
+from xeno.router.providers import CompletionResult, Provider, ProviderError, build_provider
 from xeno.security.outbound import sanitize
 from xeno.security.scanner import SecretScanner
 
@@ -320,12 +320,16 @@ class Router:
                 latency_ms=round(result.latency_ms, 2),
                 prefix_signature=record.prefix_signature,
             )
-            if result.truncated or result.silent:
+            if result.truncated or result.silent or result.prompt_truncated:
                 self.runlog.event(
                     EventKind.MODEL_INCOMPLETE,
                     node=node.value,
                     model=entry.ref,
-                    reason="truncated" if result.truncated else "empty_content",
+                    # `prompt_truncated` first: it is the only one of the three
+                    # that says the model answered a DIFFERENT question than
+                    # the one asked, so it must not be reported as a merely
+                    # short answer.
+                    reason=_incomplete_reason(result),
                     finish_reason=result.finish_reason,
                     max_tokens=node_spec.max_tokens,
                     output_tokens=result.usage.output_tokens,
@@ -399,3 +403,16 @@ class Router:
             )
         state.cache_stats = {**state.cache_stats, record.node: stats}
         state.iteration_count = state.iteration_count + 1
+
+
+def _incomplete_reason(result: CompletionResult) -> str:
+    """Which of the three ways a successful call can still fail to answer.
+
+    Ordered by how badly each misleads a reader. `prompt_truncated` means the
+    model was shown less than it was sent, so its answer is to a different
+    question — reporting that as a short answer would send whoever reads the
+    log looking for a format problem that is not there.
+    """
+    if result.prompt_truncated:
+        return "prompt_truncated"
+    return "truncated" if result.truncated else "empty_content"

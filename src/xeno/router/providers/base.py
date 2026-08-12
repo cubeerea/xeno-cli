@@ -65,6 +65,12 @@ class CompletionResult:
     #: scratchpad routinely contains draft tags the model then revised, and
     #: acting on those would execute a plan it had already discarded.
     reasoning: str = ""
+    #: The provider evaluated materially fewer prompt tokens than were sent,
+    #: i.e. it discarded part of the prompt before reading it. Distinct from
+    #: `truncated`, which is about the ANSWER being cut short: this one says
+    #: the model never saw the whole QUESTION. Only a backend that reports
+    #: what it actually evaluated can set it, which today means Ollama.
+    prompt_truncated: bool = False
 
     @property
     def truncated(self) -> bool:

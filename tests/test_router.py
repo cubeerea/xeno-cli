@@ -11,6 +11,7 @@ import pytest
 
 from xeno.core.config import Limits, ModelSpec, NodeSpec, ProviderSpec, XenoConfig
 from xeno.core.ledger import CostLedger
+from xeno.core.runlog import EventKind, NullRunLog
 from xeno.core.state import AgentState
 from xeno.core.types import DEFAULT_NODE_TIERS, Breakpoint, NodeRole, ProviderFamily, Tier
 from xeno.core.usage import Usage
@@ -260,3 +261,64 @@ def test_chain_primary_is_never_reported_as_an_escalation(config: XenoConfig, pr
     assert result.record.billed_tier is Tier.FLAGSHIP  # attribution still honest
     assert not result.escalated
     assert ledger.escalations == []
+
+
+# ---- incomplete answers ----------------------------------------------------
+
+
+class _RecordingLog(NullRunLog):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[dict] = []
+
+    def event(self, kind, **payload):  # type: ignore[no-untyped-def]
+        record = super().event(kind, **payload)
+        self.events.append(record)
+        return record
+
+
+def _incomplete_events(log: _RecordingLog) -> list[dict]:
+    return [e for e in log.events if e["kind"] == EventKind.MODEL_INCOMPLETE.value]
+
+
+def _router_with_log(config: XenoConfig, outcome: CompletionResult):  # type: ignore[no-untyped-def]
+    log = _RecordingLog()
+    router = Router(config, ledger=CostLedger(run_id="t"), runlog=log)
+    fakes = {name: FakeProvider(name, spec) for name, spec in config.providers.items()}
+    fakes["ollama"].outcomes = [outcome]
+    router._providers.update(fakes)
+    return router, log
+
+
+def test_a_prompt_the_backend_truncated_is_reported_as_such(config, prompt) -> None:  # type: ignore[no-untyped-def]
+    """Distinct from a short ANSWER: the model was shown less than it was
+    sent, so it answered a different question. Reporting that as `truncated`
+    would send a reader hunting for a format problem that is not there."""
+    outcome = _ok("qwen2.5-coder:14b")
+    outcome.prompt_truncated = True
+    router, log = _router_with_log(config, outcome)
+
+    router.complete(NodeRole.CODER, prompt)
+
+    events = _incomplete_events(log)
+    assert len(events) == 1
+    assert events[0]["reason"] == "prompt_truncated"
+
+
+def test_a_truncated_prompt_outranks_a_truncated_answer_in_the_report(config, prompt) -> None:  # type: ignore[no-untyped-def]
+    """Both flags can be set at once — a cut-off prompt often produces a
+    rambling answer that then hits the output cap. The prompt is the cause."""
+    outcome = _ok("qwen2.5-coder:14b")
+    outcome.prompt_truncated = True
+    outcome.finish_reason = "length"
+    router, log = _router_with_log(config, outcome)
+
+    router.complete(NodeRole.CODER, prompt)
+
+    assert _incomplete_events(log)[0]["reason"] == "prompt_truncated"
+
+
+def test_a_complete_answer_reports_nothing(config, prompt) -> None:  # type: ignore[no-untyped-def]
+    router, log = _router_with_log(config, _ok("qwen2.5-coder:14b"))
+    router.complete(NodeRole.CODER, prompt)
+    assert _incomplete_events(log) == []

@@ -41,6 +41,23 @@ class ProviderSpec(BaseModel):
     api_key_env: str | None = None
     timeout_seconds: float = Field(default=120.0, gt=0)
 
+    #: How long a LOCAL backend holds a model resident between calls.
+    #: Reloading weights between ladder iterations would dominate the latency
+    #: the local tier exists to keep low, so the default is generous. Ignored
+    #: by remote providers, which have no weights to hold.
+    keep_alive: str = "30m"
+    #: Unload local models when the run ends. On by default because the
+    #: daemon has no way to know a run finished — `keep_alive` is a timer, so
+    #: without this the weights outlive the run by design. Turn it off only if
+    #: you run back-to-back and would rather keep the models warm.
+    release_on_exit: bool = True
+    #: Override the context window discovered from the backend, in tokens.
+    #: An escape hatch, not a required setting: the window is derived per call
+    #: from the assembled prompt and clamped to what the model reports. Set it
+    #: only to force a smaller window than the model allows — to cap KV-cache
+    #: memory on a constrained machine, say.
+    max_context: int | None = Field(default=None, gt=0)
+
     @property
     def is_local(self) -> bool:
         return self.family is ProviderFamily.OLLAMA

@@ -41,6 +41,7 @@ throughout the code point back at it.
 - [Why this exists](#why-this-exists)
 - [The Mortal Forge](#the-mortal-forge)
 - [Prerequisites and installation](#prerequisites-and-installation)
+  - [How much machine you actually need](#how-much-machine-you-actually-need)
 - [Usage](#usage)
   - [First run](#first-run)
   - [Running a goal](#running-a-goal)
@@ -103,6 +104,53 @@ in plain Python — its single model call only compresses a failure log into a
 | **At least one model provider** | Ollama on `localhost:11434`, or an API key for OpenRouter / OpenAI-compatible endpoint |
 | `git` on PATH | Checkpoints, the review diff, the squash onto a branch |
 | `gh` on PATH *(optional)* | Only if you set `git.open_pr: true` |
+
+### How much machine you actually need
+
+Docker is the floor and it is not optional: the warm pool holds
+`warm_pool_size` containers at `sandbox.memory` each — 4 GB with the shipped
+defaults — for the whole run, on top of whatever the models cost.
+
+| Setup | Memory | What runs where |
+| --- | --- | --- |
+| **All API** *(recommended)* | ~8 GB | Every node on OpenRouter. Memory is Docker plus the OS; the machine barely notices the run |
+| **Hybrid** *(shipped default)* | 16 GB | flagship on API; `medium`/`light` local. Roughly 13 GB of weights *if both local models stay resident*, so 16 GB is workable and 24 GB is comfortable |
+| **Fully local** | 32 GB+ | See the caveats below before choosing this |
+
+Two things about the local numbers are worth knowing before you plan around
+them. Neither is something you configure — both are handled — but both shape
+how much memory a local run actually wants.
+
+**Context is the real constraint, not parameter count.** On this project's own
+runs the specifier sent 8.3k-token prompts against a nearly empty repository,
+and that figure grows with the codebase. A local model serving a flagship node
+therefore needs a 16k–32k window, and the KV cache for it is charged on top of
+the weights: a 14B at Q4 costs about 9.5 GB at 4k context and roughly 15 GB at
+32k. Xeno derives the window per call from the prompt it just assembled,
+rounds it up to a bucket so the model is not reloaded on every call, and
+clamps it to what the model reports. You are never asked to guess a number.
+
+This matters because Ollama otherwise serves its own default window — 4096 on
+current daemons — regardless of what the model supports, and **silently
+discards the front of any prompt that exceeds it**, which is where the system
+prompt lives. A model that appears to ignore the output format may simply
+never have been shown it. If a prompt genuinely cannot fit the model's window,
+the run stops with the two numbers in the message rather than sending a call
+that would be answered from half a prompt.
+
+**Models are released when the run ends.** Weights are held resident between
+calls, because reloading them between ladder iterations would dominate the
+latency the local tier exists to keep low — so during a run both the `medium`
+and `light` models stay in memory at once, which is where the 13 GB figure
+above comes from. A daemon has no way to know a run finished, so Xeno unloads
+them explicitly at teardown; you should get the memory back within a second of
+the run ending, not when a keep-alive timer expires. Set
+`release_on_exit: false` on the provider if you run back-to-back and would
+rather keep them warm.
+
+None of the above is a quality claim; see
+[Routing and tiers](#routing-and-tiers) for that. Enough memory makes a local
+model *run*. It does not make it flagship-class.
 
 The distribution is `xeno-cli`; the command is `xeno`.
 
@@ -336,7 +384,20 @@ caching:
 secrets:
   extra_denylist: []      # appended to the built-in denylist; never replaces it
   scan_outbound_context: true
+
+providers:                # every key below is optional and has a default
+  ollama:
+    base_url: http://localhost:11434
+    keep_alive: "30m"     # how long a local model stays resident BETWEEN calls
+    release_on_exit: true # unload when the run ends, rather than on the timer
+    max_context: null     # force a SMALLER window than the model allows
 ```
+
+The three local-only keys exist as escape hatches, not as settings you are
+expected to tune. `max_context` in particular is not how the window gets
+chosen — that is derived per call from the assembled prompt and clamped to
+what the model reports. Set it only to cap KV-cache memory below what the
+model would otherwise permit.
 
 `probe_aggregators_at_startup` costs two short calls per aggregator provider
 at run start, and is what makes explicit cache markers (and therefore M1.4)
