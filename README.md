@@ -180,8 +180,9 @@ ollama pull qwen2.5-coder:7b    # light tier  — Argus, Talos
 
 ```bash
 xeno init                 # write a starter xeno.yaml (Hardware Tier 1 defaults)
+xeno init --user          # ...or to ~/.config/xeno/, the fallback for every run
 xeno config show          # resolved config, routing table, run caps, warnings
-xeno doctor               # provider reachability and capability checks
+xeno doctor               # sandbox engine + provider reachability and capabilities
 xeno models list          # which model each node actually resolves to
 xeno models test          # exercise every tier, emit a cost.json
 ```
@@ -295,6 +296,24 @@ M1.4 is a lever *inside* M1.2, not an additive claim — do not sum them.
 `xeno init` writes a starter `xeno.yaml`. Defaults target Hardware Tier 1
 (Apple Silicon, 32 GB unified memory). On Hardware Tier 0 (8 GB VRAM), point
 medium's first entry at an API provider — a 14B local model will not fit.
+
+### Which config is in effect
+
+Resolved in order, first hit wins — no merging, so the file that wins is the
+whole answer:
+
+1. `--config <path>`
+2. `xeno.yaml` in the current directory or any parent
+3. `~/.config/xeno/xeno.yaml` (or `$XDG_CONFIG_HOME/xeno/xeno.yaml`)
+4. built-in defaults
+
+`xeno init --user` writes step 3 and creates the directory. Without it, running
+xeno outside a repo that carries its own `xeno.yaml` falls through to the
+built-in defaults, which route medium and light to **Ollama** — so an
+unconfigured directory pulls a 14B and a 7B into RAM. On a machine that cannot
+hold them the run swaps rather than fails. `xeno config show` names the file
+and the layer it came from; a run on the built-in defaults says so and lists
+the local models it is about to load.
 
 ### Routing and tiers
 

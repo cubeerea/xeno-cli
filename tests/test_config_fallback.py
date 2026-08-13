@@ -27,6 +27,7 @@ from xeno.core.config import (
     default_config,
     find_config,
     load_config,
+    user_config_path,
 )
 from xeno.core.types import Tier
 
@@ -46,9 +47,26 @@ def _written(tmp_path: Path, tiers: str) -> XenoConfig:
     run sets it — the whole point of these tests is that provenance is what
     the warning keys on."""
     nodes = "\n".join(f"  {r.value}: {{tier: {t.value}}}" for r, t in DEFAULT_NODE_TIERS.items())
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / CONFIG_FILENAME
     path.write_text(f"{tiers}nodes:\n{nodes}\n")
     return load_config(path)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_user_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Point the user-level layer at an empty directory for every test here.
+
+    Without this the suite reads whatever is in the developer's real home, so
+    the same code passes on a machine with no `~/.config/xeno/xeno.yaml` and
+    fails on one that has it — and the second machine is every machine where
+    someone has taken this feature's advice.
+    """
+    home = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    return home
 
 
 @pytest.fixture
@@ -101,10 +119,13 @@ def test_the_warning_says_how_it_fails(warnings: list[str]) -> None:
     assert any("swap" in w for w in warnings)
 
 
-def test_the_warning_says_how_to_stop_it(warnings: list[str]) -> None:
+def test_the_warning_says_how_to_stop_it_permanently(warnings: list[str]) -> None:
+    """Pointing at the tier config would fix this directory. `--user` fixes
+    every directory, which is the shape the problem actually has: you do not
+    hit this once, you hit it in each new place you try to work."""
     cli._print_capability_warnings(default_config())
     text = " ".join(warnings)
-    assert "API provider" in text
+    assert "xeno init --user" in text
     assert CONFIG_FILENAME in text
 
 
@@ -132,6 +153,94 @@ def test_a_defaulted_config_with_no_local_models_still_warns(warnings: list[str]
     text = " ".join(w for w in warnings if "defaults are in effect" in w)
     assert text, "still warned"
     assert "swap" not in text
+
+
+# ---- the user-level layer --------------------------------------------------
+
+
+def _user_file(home: Path, tiers: str = _REMOTE_TIERS) -> Path:
+    nodes = "\n".join(f"  {r.value}: {{tier: {t.value}}}" for r, t in DEFAULT_NODE_TIERS.items())
+    path = home / "xeno" / CONFIG_FILENAME
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{tiers}nodes:\n{nodes}\n")
+    return path
+
+
+def test_the_user_config_is_found_from_an_unconfigured_directory(
+    tmp_path: Path, _isolated_user_config: Path
+) -> None:
+    """The whole feature: your routing follows you out of your repo."""
+    expected = _user_file(_isolated_user_config)
+    assert find_config(tmp_path) == expected
+
+
+def test_a_project_config_still_wins(tmp_path: Path, _isolated_user_config: Path) -> None:
+    """A repository that ships a config has said something specific about how
+    it wants to be built, and a personal default must not overrule it."""
+    _user_file(_isolated_user_config)
+    project = tmp_path / CONFIG_FILENAME
+    project.write_text("tiers: {}\n")  # never parsed; find_config only stats
+    assert find_config(tmp_path) == project
+
+
+def test_a_parent_project_config_outranks_the_user_config(
+    tmp_path: Path, _isolated_user_config: Path
+) -> None:
+    """Precedence is by specificity, not by proximity in the lookup code: a
+    config three directories up is still about the project you are inside."""
+    _user_file(_isolated_user_config)
+    (tmp_path / CONFIG_FILENAME).write_text("tiers: {}\n")
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    assert find_config(nested) == tmp_path / CONFIG_FILENAME
+
+
+def test_xdg_config_home_is_honoured(_isolated_user_config: Path) -> None:
+    assert user_config_path() == _isolated_user_config / "xeno" / CONFIG_FILENAME
+
+
+def test_the_default_location_is_dot_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert user_config_path() == Path.home() / ".config" / "xeno" / CONFIG_FILENAME
+
+
+def test_a_user_config_suppresses_the_defaults_warning(
+    tmp_path: Path, _isolated_user_config: Path, warnings: list[str]
+) -> None:
+    """The point of setting one up. If it loaded but the run still warned
+    about built-in defaults, the advice the warning gives would be wrong."""
+    _user_file(_isolated_user_config)
+    cli._print_capability_warnings(load_config(find_config(tmp_path)))
+    assert not any("defaults are in effect" in w for w in warnings)
+
+
+def test_a_user_config_with_local_weights_is_not_silently_blessed(
+    tmp_path: Path, _isolated_user_config: Path, warnings: list[str]
+) -> None:
+    """Provenance suppresses the PROVENANCE warning, not the RAM one. Someone
+    who wrote a local tier chose it; someone who wrote it and then ran on a
+    smaller machine still has a 14B loading into it."""
+    _user_file(
+        _isolated_user_config,
+        _REMOTE_TIERS.replace(
+            "    - {provider: openrouter, model: remote/b, "
+            "usd_per_1m_input: 1.0, usd_per_1m_output: 1.0}",
+            "    - {provider: ollama, model: qwen2.5-coder:14b}",
+        ),
+    )
+    config = load_config(find_config(tmp_path))
+    assert config.local_models() == [(Tier.MEDIUM, "qwen2.5-coder:14b")]
+    del warnings  # nothing asserted about output; the model list is the contract
+
+
+def test_an_explicit_config_flag_beats_both(
+    tmp_path: Path, _isolated_user_config: Path
+) -> None:
+    """`--config` is someone naming a file. Nothing should outrank that."""
+    _user_file(_isolated_user_config)
+    (tmp_path / CONFIG_FILENAME).write_text("tiers: {}\n")
+    explicit = _written(tmp_path / "elsewhere", _REMOTE_TIERS)
+    assert explicit.source_path == tmp_path / "elsewhere" / CONFIG_FILENAME
 
 
 # ---- local_models ----------------------------------------------------------

@@ -374,14 +374,43 @@ class XenoConfig(BaseModel):
         return offenders
 
 
+def user_config_path() -> Path:
+    """`~/.config/xeno/xeno.yaml`, or the XDG equivalent when set.
+
+    Not merged into a project config — see `find_config`.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else Path.home() / ".config"
+    return root / "xeno" / CONFIG_FILENAME
+
+
 def find_config(start: Path | None = None) -> Path | None:
-    """Walk up from `start` looking for xeno.yaml."""
+    """The xeno.yaml that governs a run: nearest project file, else the user's.
+
+    The upward walk finds the config belonging to the repository you are
+    working in, which is the right answer whenever you are working in one. It
+    is the *fallback* that was wrong: outside such a repository the walk found
+    nothing and the built-in defaults took over, silently replacing the entire
+    routing table — including with locally-served weights, which is the one
+    substitution that can cost more than money (`XenoConfig.local_models`).
+
+    A user-level file makes "whatever I normally use" the answer to that,
+    instead of "whatever this project ships". The defaults then mean what they
+    should: the routing for someone who has never configured anything.
+
+    This is a fallback, not a layer. A project config is complete by
+    construction — `tiers` and `nodes` are both required — so there is no
+    partial file for a user-level one to fill in, and inventing a merge would
+    only make it harder to answer "which model is about to run" by reading one
+    file. `xeno config show` names the file that won.
+    """
     current = (start or Path.cwd()).resolve()
     for directory in (current, *current.parents):
         candidate = directory / CONFIG_FILENAME
         if candidate.is_file():
             return candidate
-    return None
+    user = user_config_path()
+    return user if user.is_file() else None
 
 
 def load_config(path: Path | None = None) -> XenoConfig:

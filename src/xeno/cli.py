@@ -35,6 +35,7 @@ from xeno.core.config import (
     ConfigError,
     XenoConfig,
     load_config,
+    user_config_path,
 )
 from xeno.core.ledger import CostLedger
 from xeno.core.paths import RunPaths, new_run_id, run_branch_name
@@ -123,14 +124,15 @@ def _print_capability_warnings(config: XenoConfig) -> None:
             " It routes to locally-served weights: "
             + ", ".join(f"{tier.value}={model}" for tier, model in local)
             + ". Those load into RAM on first use; on a machine that cannot "
-            "hold them the run will swap rather than fail. Point the tier at "
-            "an API provider, or run from a directory with an xeno.yaml."
+            "hold them the run will swap rather than fail."
             if local
             else ""
         )
         warnings.append(
-            f"no {CONFIG_FILENAME} found in this directory or any parent — "
-            f"built-in defaults are in effect.{detail}"
+            f"no {CONFIG_FILENAME} found in this directory, any parent, or "
+            f"{user_config_path()} — built-in defaults are in effect.{detail} "
+            "Run `xeno init --user` to make your own routing the fallback "
+            "everywhere."
         )
     if config.flagship_is_local():
         warnings.append(
@@ -277,14 +279,27 @@ def _interactive(config_path: Path | None, *, repo: Path, quiet: bool) -> None:
 def init(
     directory: Annotated[Path, typer.Argument(help="Where to write xeno.yaml.")] = Path("."),
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+    user: Annotated[
+        bool,
+        typer.Option("--user", help="Write to ~/.config/xeno/ as the fallback for every run."),
+    ] = False,
 ) -> None:
     """Write a starter xeno.yaml targeting Hardware Tier 1."""
-    target = directory / CONFIG_FILENAME
+    # The point of --user is that it needs no argument and creates its own
+    # directory: a fallback you have to hand-mkdir is one you set up after the
+    # run that made you want it, which is exactly too late.
+    target = user_config_path() if user else directory / CONFIG_FILENAME
     if target.exists() and not force:
         console.print(f"[yellow]{target} already exists.[/] Pass --force to overwrite.")
         raise typer.Exit(code=1)
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(_STARTER_CONFIG)
     console.print(f"[green]wrote[/] {target}")
+    if user:
+        console.print(
+            "This is now the config for any directory without its own "
+            f"{CONFIG_FILENAME}. A project file still wins where one exists."
+        )
     console.print(
         "Hardware Tier 0 (8 GB VRAM): point medium's first entry at an API provider — "
         "a 14B local model will not fit (PRD S9.3)."
@@ -297,8 +312,16 @@ def config_show(
 ) -> None:
     """Render the resolved configuration and any capability warnings."""
     config = _resolve_config(config_path)
-    source = config.source_path or "<built-in defaults>"
-    console.print(Panel(str(source), title="config source", expand=False))
+    # Which LAYER won, not just which path: "the user-level one" is the
+    # answer to "why is this not what the repo I am standing in declares",
+    # and a bare path leaves the reader to work that out.
+    if config.source_path is None:
+        source = "<built-in defaults>"
+    elif config.source_path == user_config_path():
+        source = f"{config.source_path}  (user-level fallback)"
+    else:
+        source = f"{config.source_path}  (project)"
+    console.print(Panel(source, title="config source", expand=False))
 
     table = Table("node", "callsign", "tier", "max tokens", title="node routing (static, v1)")
     for role in NodeRole:
