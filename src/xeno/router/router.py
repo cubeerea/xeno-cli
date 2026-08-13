@@ -234,6 +234,15 @@ class Router:
 
             started = time.perf_counter()
             try:
+                # Before the call, not inside each provider: an over-long
+                # prompt is accepted by every backend here and answered from
+                # whatever survived truncation, so the check has to be
+                # unmissable rather than reimplemented per provider. Inside
+                # the `try` so an overflow is logged, recorded, and walked
+                # past on the chain exactly like any other retryable refusal.
+                provider.assert_context_fits(
+                    sent_prompt, entry, max_tokens=node_spec.max_tokens
+                )
                 result = provider.complete(
                     sent_prompt,
                     entry,

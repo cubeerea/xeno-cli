@@ -29,6 +29,14 @@ class OpenAICompatProvider(Provider):
 
     chat_path = "/chat/completions"
 
+    def __init__(self, name: str, spec: ProviderSpec) -> None:
+        super().__init__(name, spec)
+        #: Windows from `/models`, fetched lazily. `None` means "not asked
+        #: yet"; an empty dict means asked and the provider would not say —
+        #: the two must stay distinguishable or a provider that reports
+        #: nothing gets re-fetched on every call.
+        self._context_limits: dict[str, int] | None = None
+
     def build_messages(self, prompt: AssembledPrompt) -> list[dict[str, Any]]:
         """Static-first: system region, then history, then the current turn.
 
@@ -80,6 +88,7 @@ class OpenAICompatProvider(Provider):
         max_tokens: int,
         temperature: float = 0.0,
     ) -> CompletionResult:
+        self.assert_context_fits(prompt, model, max_tokens=max_tokens)
         body, latency_ms = self._post(
             self.chat_path,
             self.build_payload(prompt, model, max_tokens=max_tokens, temperature=temperature),
@@ -95,6 +104,59 @@ class OpenAICompatProvider(Provider):
             finish_reason=finish_reason,
             reasoning=reasoning,
         )
+
+    def context_limit(self, model: str) -> int | None:
+        """The model's window per the provider's own `/models` listing.
+
+        Fetched once per process and cached whole, including the negative
+        answer. The listing is one request and a few hundred kilobytes; making
+        it per call would add that to every node in the graph, and making it
+        per miss would re-fetch it for each unknown model on a provider that
+        does not report windows at all.
+
+        Key names differ across implementations of the same protocol —
+        OpenRouter reports `context_length`, vLLM `max_model_len`, others
+        `context_window` — so all three are accepted rather than picking one
+        and quietly returning `None` everywhere else.
+        """
+        if self.spec.max_context is not None:
+            return self.spec.max_context
+        if self._context_limits is None:
+            self._context_limits = self._fetch_context_limits()
+        return self._context_limits.get(model)
+
+    def _fetch_context_limits(self) -> dict[str, int]:
+        """`{model_id: window}` from `/models`, or `{}` if it cannot be read.
+
+        Never raises. A provider that will not describe its own models is not
+        a reason to fail a run — it only means the overflow guard has nothing
+        to check against, which is exactly where it started.
+        """
+        limits: dict[str, int] = {}
+        try:
+            response = self.client.get("/models")
+            if response.status_code >= 400:
+                return limits
+            payload = response.json()
+        except Exception:
+            return limits
+
+        entries = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            return limits
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            model_id = entry.get("id")
+            if not isinstance(model_id, str):
+                continue
+            for key in ("context_length", "max_model_len", "context_window"):
+                value = entry.get(key)
+                if isinstance(value, int) and value > 0:
+                    limits[model_id] = value
+                    break
+        return limits
 
     def health_check(self) -> tuple[bool, str]:
         if not self.spec.key_available():

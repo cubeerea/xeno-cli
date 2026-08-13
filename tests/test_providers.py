@@ -422,7 +422,11 @@ def test_a_prompt_too_large_for_the_model_is_refused_not_truncated() -> None:
     assert "4096" in message, "the ceiling the reader has to work around"
     assert str(_big_prompt(20_000).approx_tokens) in message, "what the call actually needed"
     assert "system prompt" in message
-    assert excinfo.value.retryable is False, "a bigger window will not appear on retry"
+    # Retryable so the ROUTER walks the tier chain. Retrying the same model
+    # would indeed be pointless, but the next chain entry is a different
+    # model — and an escalation entry is typically the larger-window one, so
+    # an overflow is exactly the error the chain exists to route around.
+    assert excinfo.value.retryable is True, "the next chain entry may have a bigger window"
     assert not daemon.chats, "nothing was sent"
 
 

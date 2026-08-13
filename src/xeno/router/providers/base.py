@@ -28,6 +28,13 @@ from xeno.core.types import Breakpoint, ProviderFamily
 from xeno.core.usage import Usage
 from xeno.prompt.assembly import AssembledPrompt
 
+#: Generation room that must fit alongside the prompt for a call to be worth
+#: making at all. A node cut off below this returns a fragment, and every
+#: parser in `xeno.graph.prompts` reads a fragment as a format failure — so the
+#: run pays for the call, pays again for the corrective retry, and still has
+#: nothing to act on.
+MIN_OUTPUT_HEADROOM = 1024
+
 
 class ProviderError(Exception):
     """A failed model call.
@@ -138,6 +145,63 @@ class Provider(ABC):
     @abstractmethod
     def health_check(self) -> tuple[bool, str]:
         """(reachable, detail). Never raises; used by `xeno models test`."""
+
+    # ---- context window -------------------------------------------------
+
+    def context_limit(self, model: str) -> int | None:
+        """The model's context window in tokens, or `None` when unknown.
+
+        `None` is a real answer, not a failure: a backend that will not say
+        what a model's window is gives no grounds to refuse the call, so the
+        guard treats not-knowing as "do not clamp". Subclasses override to
+        discover it (Ollama from `/api/show`, OpenRouter from `/models`);
+        the base answer is whatever the user pinned in config.
+
+        `ProviderSpec.max_context` wins over discovery wherever it is set,
+        because its documented purpose is to force a SMALLER window than the
+        model allows — a discovered ceiling that overrode it would silently
+        undo the only reason anyone sets it.
+        """
+        del model
+        return self.spec.max_context
+
+    def assert_context_fits(
+        self, prompt: AssembledPrompt, model: ModelSpec, *, max_tokens: int
+    ) -> None:
+        """Refuse a prompt that cannot fit the model's window, before sending.
+
+        Every provider in this package will otherwise accept an over-long
+        prompt and answer from whatever survived — Ollama discards the front
+        (which is the system prompt), and hosted APIs differ by vendor and by
+        day. The common thread is that the call SUCCEEDS: a plausible answer
+        comes back, the parser accepts it, and nothing in the log distinguishes
+        it from a call that saw the whole prompt. Ollama has checked this since
+        `num_ctx` derivation landed; the rest of the providers were sending
+        blind, which matters more now that the default medium and light tiers
+        can be hosted models.
+
+        Raised as retryable so the router walks the tier chain: a window
+        overflow is one of the few errors the NEXT entry genuinely may not
+        have, since escalation entries are usually larger-window models. If
+        every entry overflows, `ChainExhaustedError` reports all of them.
+        """
+        ceiling = self.context_limit(model.model)
+        if ceiling is None:
+            return
+        needed = prompt.approx_tokens + MIN_OUTPUT_HEADROOM
+        if needed <= ceiling:
+            return
+        raise ProviderError(
+            f"{model.model} serves a {ceiling}-token context window, but this call "
+            f"needs ~{prompt.approx_tokens} for the prompt and at least "
+            f"{MIN_OUTPUT_HEADROOM} to answer in. Sending it would have the provider "
+            f"drop the front of the prompt and answer from the rest — and per "
+            f"ASSEMBLY_ORDER the front is the system prompt, so the symptom is a model "
+            f"that appears not to know the output format it was never shown. Route this "
+            f"node to a larger-window model, or lower its max_tokens.",
+            provider=self.name,
+            retryable=True,
+        )
 
     # ---- shared helpers -------------------------------------------------
 

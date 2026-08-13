@@ -50,11 +50,6 @@ from xeno.router.providers.base import (
 #: steps the window a handful of times per run rather than on every call.
 _CONTEXT_BUCKETS = (4096, 8192, 16384, 32768, 65536, 131072)
 
-#: Generation room that must fit alongside the prompt for a call to be worth
-#: making at all. A node cut off below this returns a fragment, and every
-#: parser in `xeno.graph.prompts` reads a fragment as a format failure.
-_MIN_OUTPUT_HEADROOM = 1024
-
 #: How far `prompt_eval_count` may fall below the estimate before it is read
 #: as truncation rather than estimator drift. The estimate is a flat
 #: 4-chars-per-token rule, wrong by perhaps a fifth either way; a window
@@ -98,6 +93,11 @@ class OllamaProvider(Provider):
         max_tokens: int,
         temperature: float = 0.0,
     ) -> CompletionResult:
+        # Also checked by the router before dispatch. Repeated here because
+        # this provider is the one that will definitely truncate rather than
+        # error, and the check is a dict lookup — cheap enough that "whoever
+        # calls complete() is protected" beats saving it.
+        self.assert_context_fits(prompt, model, max_tokens=max_tokens)
         estimated_prompt = prompt.approx_tokens
         payload = {
             "model": model.model,
@@ -144,22 +144,11 @@ class OllamaProvider(Provider):
         neither fact is the user's to supply (`ProviderSpec.max_context`
         exists to force a SMALLER window, not to make one mandatory).
         """
-        ceiling = self.spec.max_context or self._context_limit(model)
-        if ceiling is not None and prompt_tokens + _MIN_OUTPUT_HEADROOM > ceiling:
-            # Refused rather than sent. Ollama would take this call, discard
-            # the front of the prompt, and answer confidently from whatever
-            # was left — which is the failure this whole module now exists to
-            # prevent. A number the reader can act on beats a silent answer.
-            raise ProviderError(
-                f"{model} serves a {ceiling}-token context window, but this call needs "
-                f"~{prompt_tokens} for the prompt and at least {_MIN_OUTPUT_HEADROOM} to "
-                f"answer in. Ollama would silently discard the front of the prompt, which "
-                f"is the system prompt. Use a model with a larger window, or route this "
-                f"node to an API tier.",
-                provider=self.name,
-                retryable=False,
-            )
-
+        # The overflow REFUSAL now lives in `Provider.assert_context_fits`,
+        # which the router calls for every provider before dispatch — this
+        # method is left with the job only it can do, which is choosing the
+        # window to actually ask for.
+        ceiling = self.context_limit(model)
         needed = prompt_tokens + max_tokens
         window = next((b for b in _CONTEXT_BUCKETS if b >= needed), _CONTEXT_BUCKETS[-1])
         if ceiling is not None:
@@ -168,7 +157,7 @@ class OllamaProvider(Provider):
         self._window_floor[model] = window
         return window
 
-    def _context_limit(self, model: str) -> int | None:
+    def context_limit(self, model: str) -> int | None:
         """What window the model was built with, per the daemon, or `None`.
 
         `None` is a real answer and is cached as one: an older daemon that
@@ -176,6 +165,8 @@ class OllamaProvider(Provider):
         and the caller treats not-knowing as "do not clamp" rather than as an
         error — a missing ceiling is no reason to refuse to run.
         """
+        if self.spec.max_context is not None:
+            return self.spec.max_context
         if model in self._context_limits:
             return self._context_limits[model]
 
