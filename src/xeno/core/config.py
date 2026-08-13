@@ -331,6 +331,24 @@ class XenoConfig(BaseModel):
         chain = self.tiers.get(Tier.FLAGSHIP, ())
         return any(self.providers[e.provider].is_local for e in chain)
 
+    def local_models(self) -> list[tuple[Tier, str]]:
+        """Every `(tier, model)` this config will serve from a local backend.
+
+        Weights are the one configuration choice that spends a resource the
+        harness cannot meter, throttle, or roll back. A remote model that is
+        too big for the budget shows up as a number in cost.json; a local one
+        that is too big for the machine shows up as swap thrash, and past a
+        point the window server stops answering its watchdog and the OS
+        restarts. Anything that reports what a run is about to do needs to be
+        able to name them.
+        """
+        return [
+            (tier, entry.model)
+            for tier, chain in self.tiers.items()
+            for entry in chain
+            if self.providers[entry.provider].is_local
+        ]
+
     def downward_fallbacks(self) -> list[tuple[Tier, str]]:
         """Fallback entries that resolve to a model serving a WEAKER tier.
 

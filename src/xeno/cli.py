@@ -108,6 +108,30 @@ def _print_capability_warnings(config: XenoConfig) -> None:
     threshold that makes a local model flagship-class on this project's target
     hardware, so there is no threshold in the check."""
     warnings: list[str] = []
+    if config.source_path is None:
+        # `find_config` walks up from the cwd, so running xeno anywhere
+        # outside a repo that has an xeno.yaml silently swaps the whole
+        # routing table for the built-in defaults. Those default to Ollama on
+        # the medium and light tiers, which is the right shipped default and
+        # the wrong thing to do QUIETLY: the observable effect of running in
+        # an unconfigured directory was a machine loading several GB of
+        # weights it had not been asked for. Naming the models is the point —
+        # "using defaults" alone does not tell you what is about to be
+        # resident in RAM.
+        local = config.local_models()
+        detail = (
+            " It routes to locally-served weights: "
+            + ", ".join(f"{tier.value}={model}" for tier, model in local)
+            + ". Those load into RAM on first use; on a machine that cannot "
+            "hold them the run will swap rather than fail. Point the tier at "
+            "an API provider, or run from a directory with an xeno.yaml."
+            if local
+            else ""
+        )
+        warnings.append(
+            f"no {CONFIG_FILENAME} found in this directory or any parent — "
+            f"built-in defaults are in effect.{detail}"
+        )
     if config.flagship_is_local():
         warnings.append(
             "FLAGSHIP tier resolves to a locally-served model. Fully local is a "
