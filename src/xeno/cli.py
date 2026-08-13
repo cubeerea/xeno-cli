@@ -48,6 +48,8 @@ from xeno.prompt.assembly import PromptBuilder
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.providers import UnsupportedProviderError
 from xeno.router.router import ChainExhaustedError, Router
+from xeno.sandbox.engine import EngineUnavailable
+from xeno.sandbox.engine import probe as engine_probe
 from xeno.security.mounts import mount_ignore
 from xeno.security.scanner import SecretScanner
 from xeno.ui.live import LiveRunView, NullRunView, RunView
@@ -307,8 +309,18 @@ def config_show(
 def doctor(
     config_path: ConfigOption = None,
 ) -> None:
-    """Check that every configured provider is reachable and usable."""
+    """Check that the sandbox engine and every configured provider are usable."""
     config = _resolve_config(config_path)
+
+    # First, because it is the one dependency whose absence makes the other
+    # rows moot: providers can all be green and the run still evaluates
+    # nothing. Its detail line is multi-line by design (it explains what to
+    # start), so it prints above the table rather than inside a cell.
+    engine_ok, engine_detail = engine_probe()
+    if engine_ok:
+        console.print(f"[green]sandbox[/] {engine_detail}")
+    else:
+        _error(engine_detail)
     ledger = CostLedger(run_id="doctor")
     router = Router(config, ledger=ledger)
 
@@ -343,7 +355,7 @@ def doctor(
 
     _print_capability_warnings(config)
 
-    if not ok:
+    if not (ok and engine_ok):
         raise typer.Exit(code=1)
 
 
@@ -598,7 +610,16 @@ def _execute(
             runlog=runlog,
             toolchain=toolchain,
         )
-        session.start(stack)
+        try:
+            session.start(stack)
+        except EngineUnavailable as exc:
+            # `_preflight` already found the engine, so this is it going away
+            # mid-run rather than a misconfiguration. Same message, and the
+            # ExitStack still unwinds the worktree and writes the ledger, so
+            # the tokens already spent are still accounted for.
+            _error(str(exc))
+            raise typer.Exit(code=2) from exc
+
         _seed_context_files(ctx.state, worktree, context_files)
 
         # The live view is only pinned around the graph itself: warnings and
@@ -705,6 +726,17 @@ def _preflight(config: XenoConfig) -> None:
             "(PRD S13 Phase 3: every completed task is a commit, and a failed one "
             "rolls back to the last one)"
         )
+        raise typer.Exit(code=2)
+
+    # Before the worktree copy, the spec conversation, and the discovery call
+    # — all of which are wasted if no gate can run. This check used to happen
+    # implicitly inside `ToolchainSession.start`, which is several model calls
+    # downstream of here, and it surfaced as a raw urllib3 traceback ending in
+    # a bare "No such file or directory" that read like a problem with the
+    # user's own repository (`xeno.sandbox.engine`).
+    reachable, detail = engine_probe()
+    if not reachable:
+        _error(detail)
         raise typer.Exit(code=2)
 
     _print_capability_warnings(config)

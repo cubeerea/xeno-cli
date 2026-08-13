@@ -44,6 +44,7 @@ from xeno.core.runlog import EventKind, RunLog
 from xeno.core.state import AgentState
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.router import Router
+from xeno.sandbox.engine import connect as connect_engine
 from xeno.sandbox.pool import WarmPool, prepare_gate_image
 
 
@@ -95,8 +96,13 @@ class ToolchainSession:
         Teardown is registered against the session, not the pool, so a
         mid-run swap cannot strand the pool that replaced the one the stack
         was originally told about.
+
+        The CLI checks the engine in `_preflight`, long before this runs, so
+        reaching a failure HERE means the engine went away between that check
+        and now — a Docker Desktop quit or an OOM kill mid-run. Rare, but it
+        raises `EngineUnavailable` rather than a urllib3 traceback either way.
         """
-        self._client = docker.from_env()
+        self._client = connect_engine()
         stack.callback(self._client.close)
         stack.callback(self.shutdown)
         self._build_pool()
