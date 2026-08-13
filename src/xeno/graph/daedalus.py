@@ -21,11 +21,12 @@ from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
-from xeno.graph.context import build_codebase_map
+from xeno.graph.context import build_codebase_map, focus_paths
 from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import (
     WorktreeEscape,
     complete_with_format_retry,
+    condense_file_blocks,
     write_file_blocks,
 )
 from xeno.graph.plan import current_focus
@@ -83,6 +84,7 @@ def make_daedalus_node(
     paths: RunPaths,
     worktree: Path,
     law: ProjectLaw,
+    written_this_run: Callable[[], set[Path]],
     touched_files: list[Path],
     report_refused: Callable[[bool, str], None],
     last_refusal: Callable[[], str],
@@ -117,7 +119,9 @@ def make_daedalus_node(
         # We always pass freshly-computed text immediately before build(), so
         # we are always the refresher PromptBuilder's contract expects
         # (PRD S9.6.5) — never a stale reader of a previously built map.
-        focus = [h.path for h in state.context_handles] or None
+        focus = focus_paths(
+            (h.path for h in state.context_handles), written_this_run()
+        ) or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
 
         current_turn = _build_current_turn(state, last_refusal())
@@ -133,6 +137,7 @@ def make_daedalus_node(
                 current_turn=current_turn,
                 correction=DAEDALUS_FORMAT_CORRECTION,
                 parse=parse_daedalus_output,
+                condense=condense_file_blocks,
             )
         except ChainExhaustedError as exc:
             state.halt_reason = f"daedalus: {exc}"

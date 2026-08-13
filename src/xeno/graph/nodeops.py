@@ -22,6 +22,7 @@ behind that decision is still on disk when someone comes to read it.
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Protocol, TypeVar
@@ -60,6 +61,70 @@ class ParsedOutput(Protocol):
 _OutputT = TypeVar("_OutputT", bound=ParsedOutput)
 
 
+#: Matches one emitted `<xeno-file path="...">...</xeno-file>` block. Applied
+#: to a model's OWN response on its way into history, never to input.
+_FILE_BLOCK_RE = re.compile(
+    r'<xeno-file\s+path="(?P<path>[^"]*)"\s*>(?P<body>.*?)</xeno-file>',
+    re.DOTALL,
+)
+
+
+def condense_file_blocks(text: str) -> str:
+    """Replace file bodies in a node's own past response with a reference.
+
+    The single largest avoidable cost in a long run. Daedalus's assistant
+    turns carry every file it wrote, verbatim, and history is append-only, so
+    by task 20 it is re-sending every file it has ever written on every call —
+    measured at ~51k tokens against a codebase map that is hard-capped at
+    ~6k. Cache discounts do not help: a cached token still occupies the
+    context window and still dilutes attention, which is the actual complaint.
+
+    Safe because the bytes are not being discarded, only de-duplicated. The
+    file was written to the worktree, so the SAME content is already in the
+    CODEBASE MAP one block up in the very same prompt — the model was reading
+    it twice. What history has to preserve is the DECISION (this node wrote
+    this path, on purpose), and the decision is what survives here.
+
+    Which is why this is opt-in per node rather than applied to every
+    response, and why only the SOURCE writers pass it:
+
+    * Daedalus and Chiron write into the worktree, and the map renders the
+      worktree. `xeno.graph.build` tracks `written_this_run` so those files
+      stay in the map's focus — without it, Argus's focus selection would
+      narrow the map to files IT picked and quietly exclude the ones the
+      writer just produced, and then neither copy would exist.
+    * Lachesis must NOT condense. It writes test files, and the map excludes
+      test content on purpose (`_CONTENT_EXCLUDED_DIRS`) so that the code
+      being checked never gets handed its own answer key. There is no second
+      copy for a test to fall back on, so eliding one would simply delete it.
+
+    The marker says "emitted", not "written", because a response is appended
+    to history before its write is attempted — a test-file refusal rejects
+    the whole response after this point, and a marker claiming the bytes
+    reached disk would be a lie the model then reasons from.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        body = match.group("body")
+        path = match.group("path")
+        # Nothing to gain on a block smaller than the reference replacing it.
+        if len(body) <= _CONDENSE_MIN_BODY:
+            return match.group(0)
+        return (
+            f'<xeno-file path="{path}">'
+            f"[{len(body)} bytes emitted for {path} and elided from this transcript; "
+            f"if the write landed, the file's current contents are in the CODEBASE MAP "
+            f"above]"
+            f"</xeno-file>"
+        )
+
+    return _FILE_BLOCK_RE.sub(replace, text)
+
+
+#: Below this, the reference line costs more than the body it replaces.
+_CONDENSE_MIN_BODY = 200
+
+
 def complete_with_format_retry(
     *,
     router: Router,
@@ -70,6 +135,7 @@ def complete_with_format_retry(
     current_turn: str,
     correction: str,
     parse: Callable[[str], _OutputT],
+    condense: Callable[[str], str] | None = None,
 ) -> _OutputT:
     """Call `node`'s model, re-prompting once with `correction` if the
     response does not parse.
@@ -96,7 +162,13 @@ def complete_with_format_retry(
         builder.append_turn("user", turn_text)
         # An empty assistant turn is rejected outright by some providers, and
         # replaying one would poison every later call on this builder.
-        builder.append_turn("assistant", result.text or "(the model returned no text)")
+        #
+        # `condense` runs on the way INTO history only. `parse` above sees the
+        # verbatim response, so what the node acts on is never the shortened
+        # form — the elision changes what gets re-sent on later calls, not what
+        # this call decided.
+        recorded = result.text or "(the model returned no text)"
+        builder.append_turn("assistant", condense(recorded) if condense else recorded)
         attempts.append(result)
 
         output = parse(result.text)

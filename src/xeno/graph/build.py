@@ -151,6 +151,12 @@ class _LoopContext:
         #: SINCE THE START of this run (not merely since the last write).
         self.last_snapshot = _snapshot(worktree)
         self.created_this_run: set[str] = set()
+        #: Every path any node has written this run. Distinct from
+        #: `created_this_run`, which tracks CREATION for the destructive-action
+        #: check: a file that already existed and was then rewritten is not
+        #: "created", but it is still something the writer needs to keep
+        #: seeing. Feeds the codebase-map focus (`_written_paths`).
+        self.written_this_run: set[Path] = set()
         #: Argus's most recent repo-skeleton Handle. Odysseus reads this by
         #: reference (`xeno.graph.odysseus`'s docstring explains why it is
         #: not an `AgentState` field): a one-shot planning aid, not
@@ -278,6 +284,7 @@ def build_graph(
         paths=paths,
         worktree=worktree,
         law=law,
+        written_this_run=lambda: ctx.written_this_run,
         touched_files=touched_files,
         report_refused=ctx.set_daedalus_result,
         last_refusal=ctx.take_daedalus_refusal,
@@ -289,6 +296,7 @@ def build_graph(
         paths=paths,
         worktree=worktree,
         law=law,
+        written_this_run=lambda: ctx.written_this_run,
         touched_files=touched_files,
         report_declined=ctx.set_chiron_result,
         last_refusal=ctx.take_refusal,
@@ -331,6 +339,8 @@ def build_graph(
         """
         assert state.diff_handle is not None, "caller must only invoke this after a real write"
         record_diff(state, state.diff_handle.sha256)
+
+        ctx.written_this_run.update(touched_files)
 
         after = _snapshot(worktree)
         removed_now = ctx.last_snapshot - after

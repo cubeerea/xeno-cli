@@ -82,11 +82,63 @@ def _walk(root: Path, ignore: frozenset[str]) -> Iterable[Path]:
             yield entry
 
 
+#: Cap on the file-tree listing, separately from file CONTENT.
+#:
+#: The listing was the one part of this block with no bound at all. Content is
+#: budgeted, but the tree prints every path in the worktree, so its size is set
+#: by file COUNT rather than by anything the budget controls — measured at
+#: ~8.9 KB on this repo's 55 source files, and a repository an order of
+#: magnitude larger would spend more prompt on a list of paths than the content
+#: budget allows for the code itself. Truncation is by whole lines with an
+#: explicit count of what was dropped, because a tree silently missing its tail
+#: reads exactly like a project that does not contain those files.
+DEFAULT_MAX_TREE_BYTES = 6_000
+
+
+def focus_paths(handles: Iterable[Path], written: Iterable[Path]) -> list[Path]:
+    """What a writing node should see the contents of: Argus's selection plus
+    everything this run has already written.
+
+    The second half is not a nicety. `focus` is a filter, so a non-empty
+    selection that omits a file makes that file's content invisible — and
+    Argus selects for RESEARCH, before the write exists. Daedalus would write
+    `src/foo.py`, come back on the next ladder rung, and find it gone from the
+    map, having been narrowed out by a selection made before it existed.
+
+    That was survivable while the model's own response still carried the file
+    verbatim in history. `condense_file_blocks` removes that second copy on
+    the grounds that the map holds the first, so this is what makes the
+    grounds true.
+    """
+    ordered = {p.resolve(): p for p in handles}
+    ordered.update({p.resolve(): p for p in written})
+    return list(ordered.values())
+
+
+def _tree_lines(files: Sequence[Path], worktree: Path, budget: int) -> list[str]:
+    """The file-tree listing, capped by bytes and truncated by whole lines.
+
+    Says how many paths it dropped rather than trailing off. A node that reads
+    a short tree and concludes the project has no `tests/` directory will act
+    on that, and the acting is the expensive part.
+    """
+    rendered: list[str] = []
+    spent = 0
+    for index, path in enumerate(files):
+        line = f"  {path.relative_to(worktree).as_posix()}"
+        if spent + len(line) + 1 > budget:
+            return [*rendered, f"  ... {len(files) - index} more path(s) not listed"]
+        rendered.append(line)
+        spent += len(line) + 1
+    return rendered
+
+
 def build_codebase_map(
     worktree: Path,
     *,
     focus: Sequence[Path] | None = None,
     max_content_bytes: int = 16_000,
+    max_tree_bytes: int = DEFAULT_MAX_TREE_BYTES,
 ) -> str:
     """A file tree plus file content, budget-capped.
 
@@ -105,7 +157,7 @@ def build_codebase_map(
     """
     files = list(_walk(worktree, DEFAULT_IGNORES))
     lines = ["Repository file tree:"]
-    lines.extend(f"  {f.relative_to(worktree).as_posix()}" for f in files)
+    lines.extend(_tree_lines(files, worktree, max_tree_bytes))
     lines.append("")
     lines.append("File contents:")
 
