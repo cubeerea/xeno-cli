@@ -88,21 +88,31 @@ class GateProfile(StrEnum):
 
 
 class Breakpoint(StrEnum):
-    """The four prompt layers, in assembly order (PRD S9.6.2, T8).
+    """The five prompt layers, in assembly order (PRD S9.6.2, T8).
 
     Declaration order is assembly order and is load-bearing: `sorted()` over
     these values must never be used to order a prompt. Use ASSEMBLY_ORDER.
     """
 
     SYSTEM = "system"
+    PROJECT_LAW = "project_law"
     CODEBASE_MAP = "codebase_map"
     ACCUMULATED_HISTORY = "accumulated_history"
     CURRENT_TURN = "current_turn"
 
 
 #: Static-first assembly order. CURRENT_TURN is always last and never cached.
+#:
+#: PROJECT_LAW sits between SYSTEM and CODEBASE MAP because static-first means
+#: most-stable-first, and law is the more stable of the two: the spec never
+#: changes within a run, the roadmap changes only on a re-plan, and memory only
+#: when a human rejects something — whereas the map is invalidated by every
+#: source write. Putting law above the map means a Daedalus write costs the map
+#: its cache entry and leaves law's untouched; putting it below would make
+#: every write re-send the project's own constitution at full price.
 ASSEMBLY_ORDER: tuple[Breakpoint, ...] = (
     Breakpoint.SYSTEM,
+    Breakpoint.PROJECT_LAW,
     Breakpoint.CODEBASE_MAP,
     Breakpoint.ACCUMULATED_HISTORY,
     Breakpoint.CURRENT_TURN,

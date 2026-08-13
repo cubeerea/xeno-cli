@@ -37,6 +37,7 @@ from xeno.core.usage import Usage
 from xeno.graph.build import MAX_WRITE_REFUSALS, run_graph
 from xeno.graph.gates import GateOutcome
 from xeno.graph.lachesis import MAX_PLAN_OBJECTIONS
+from xeno.graph.law import ProjectLaw
 from xeno.graph.plan import read_roadmap
 from xeno.prompt.keys import CacheKeyring
 from xeno.router.providers.base import CompletionResult, Provider, ProviderError
@@ -1365,6 +1366,7 @@ def _greenfield_plan(
         keyring=CacheKeyring(run_id="t", worktree_root=worktree),
         paths=run_paths,
         worktree=worktree,
+        law=ProjectLaw(repo_root=run_paths.repo_root),
         touched_files=[],
         toolchain_established=lambda: established,
         report_refused=lambda _refused: None,

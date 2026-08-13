@@ -68,6 +68,26 @@ def codebase_cache_key(run_id: str, worktree_content_hash: str) -> str:
     return _digest("codebase", run_id, worktree_content_hash)
 
 
+def law_cache_key(run_id: str, law_text: str) -> str:
+    """Keyed on the law text ITSELF, not on a dirty flag.
+
+    The codebase map can afford `mark_worktree_written` because there is
+    exactly one class of writer (Daedalus and Chiron, through the worktree) and
+    the map is far too large to re-hash per call. Project law has neither
+    property: it is a few kilobytes, and it changes through channels no write
+    signal covers — a human editing `.xeno/memory.md` between runs, an
+    extraction step appending a preference, Odysseus rewriting the roadmap on a
+    re-plan. A dirty flag would have to be raised correctly at every one of
+    those sites, and the failure mode when one is missed is the worst kind:
+    a cache hit serving the PREVIOUS law, so a node confidently obeys a
+    preference the human just changed, with nothing in the log to show it.
+
+    Hashing the content makes the key self-invalidating, so there is no
+    discipline left for a caller to get wrong.
+    """
+    return _digest("law", run_id, hashlib.sha256(law_text.encode()).hexdigest())
+
+
 def history_cache_key(run_id: str, node: NodeRole, turn_index: int) -> str:
     """Append-only: the key advances with the turn count, so the prefix through
     the prior turn stays cache-eligible (PRD S9.6.1)."""
@@ -146,6 +166,9 @@ class CacheKeyring:
 
     def codebase_key(self) -> str:
         return codebase_cache_key(self.run_id, self.content_hash())
+
+    def law_key(self, law_text: str) -> str:
+        return law_cache_key(self.run_id, law_text)
 
     def system_key(self, node: NodeRole, system_prompt_text: str) -> str:
         return system_cache_key(node, system_prompt_text)

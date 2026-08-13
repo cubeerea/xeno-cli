@@ -22,6 +22,7 @@ from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import (
     WorktreeEscape,
     complete_with_format_retry,
@@ -81,6 +82,7 @@ def make_daedalus_node(
     keyring: CacheKeyring,
     paths: RunPaths,
     worktree: Path,
+    law: ProjectLaw,
     touched_files: list[Path],
     report_refused: Callable[[bool, str], None],
     last_refusal: Callable[[], str],
@@ -107,6 +109,10 @@ def make_daedalus_node(
         nonlocal call_index
         call_index += 1
         state.iterations_this_task += 1
+
+        # Re-rendered per call: a re-plan rewrites the roadmap and a human
+        # rejection appends to memory, so law is not constant within a run.
+        builder.set_project_law(law.render(state))
 
         # We always pass freshly-computed text immediately before build(), so
         # we are always the refresher PromptBuilder's contract expects

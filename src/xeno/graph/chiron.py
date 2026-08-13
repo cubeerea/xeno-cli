@@ -18,6 +18,7 @@ from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import (
     WorktreeEscape,
     complete_with_format_retry,
@@ -85,6 +86,7 @@ def make_chiron_node(
     keyring: CacheKeyring,
     paths: RunPaths,
     worktree: Path,
+    law: ProjectLaw,
     touched_files: list[Path],
     report_declined: Callable[[bool, str], None],
     last_refusal: Callable[[], str],
@@ -116,6 +118,7 @@ def make_chiron_node(
         state.iterations_this_task += 1
 
         # PRD S9.6.5: refreshed immediately before build(), never stale.
+        builder.set_project_law(law.render(state))
         focus = [h.path for h in state.context_handles] or None
         builder.set_codebase_map(build_codebase_map(worktree, focus=focus), require_fresh=False)
 

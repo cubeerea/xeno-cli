@@ -19,6 +19,7 @@ from xeno.core.state import AgentState, Handle
 from xeno.core.types import DEFAULT_NODE_TIERS, GateProfile, Tier
 from xeno.core.usage import Usage
 from xeno.graph.lachesis import MAX_PLAN_OBJECTIONS, MAX_VERIFY_REFUSALS, make_lachesis_nodes
+from xeno.graph.law import ProjectLaw
 from xeno.graph.plan import Milestone, Plan, PlanTask, Roadmap, read_plan, write_plan, write_roadmap
 from xeno.graph.testfiles import is_test_file
 from xeno.prompt.keys import CacheKeyring
@@ -98,6 +99,7 @@ def _harness(
         keyring=CacheKeyring(run_id="t", worktree_root=worktree),
         paths=RunPaths(repo_root=tmp_path, run_id="t").ensure(),
         worktree=worktree,
+        law=ProjectLaw(repo_root=tmp_path),
         touched_files=[],
         toolchain_established=lambda: established,
         report_refused=refusals.append,

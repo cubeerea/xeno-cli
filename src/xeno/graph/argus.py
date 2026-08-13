@@ -29,6 +29,7 @@ from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import current_task, read_plan
 from xeno.graph.prompts import (
@@ -55,6 +56,7 @@ def make_argus_nodes(
     keyring: CacheKeyring,
     paths: RunPaths,
     worktree: Path,
+    law: ProjectLaw,
     publish_skeleton: Callable[[Handle], None],
 ) -> tuple[Callable[[AgentState], AgentState], Callable[[AgentState], AgentState]]:
     """Build Argus's two node functions, sharing ONE `PromptBuilder`.
@@ -85,6 +87,7 @@ def make_argus_nodes(
         nonlocal skeleton_call_index
         skeleton_call_index += 1
 
+        builder.set_project_law(law.render(state))
         builder.set_codebase_map(
             build_codebase_map(worktree, max_content_bytes=0), require_fresh=False
         )
@@ -119,6 +122,7 @@ def make_argus_nodes(
         plan = read_plan(state.plan)
         task = current_task(plan, state.task_cursor)
 
+        builder.set_project_law(law.render(state))
         builder.set_codebase_map(
             build_codebase_map(worktree, max_content_bytes=0), require_fresh=False
         )

@@ -34,6 +34,7 @@ from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import (
     Milestone,
@@ -99,6 +100,7 @@ def make_odysseus_node(
     config: XenoConfig,
     keyring: CacheKeyring,
     paths: RunPaths,
+    law: ProjectLaw,
     skeleton: Callable[[], Handle | None],
 ) -> Callable[[AgentState], AgentState]:
     """Build the Odysseus node. `skeleton` reads back whatever
@@ -125,6 +127,8 @@ def make_odysseus_node(
         # expansion that follows straight back here on a settled question.
         plan_objection = state.plan_objection or ""
         state.plan_objection = None
+
+        builder.set_project_law(law.render(state))
 
         skeleton_handle = skeleton()
         skeleton_text = skeleton_handle.read_text() if skeleton_handle else ""

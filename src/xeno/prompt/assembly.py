@@ -1,8 +1,9 @@
 """Static-first prompt assembly (PRD T8, S9.6.2).
 
     [ SYSTEM PROMPT + TOOL SCHEMAS ]   breakpoint 1 - changes only on upgrade
-    [ CODEBASE MAP / CONTEXT HANDLES ] breakpoint 2 - changes only on a write
-    [ ACCUMULATED HISTORY ]            breakpoint 3 - append-only within a run
+    [ PROJECT LAW ]                    breakpoint 2 - spec, roadmap, memory
+    [ CODEBASE MAP / CONTEXT HANDLES ] breakpoint 3 - changes only on a write
+    [ ACCUMULATED HISTORY ]            breakpoint 4 - append-only within a run
     [ CURRENT TURN ]                   never cached
 
 T8 calls this a construction rule rather than an optimization, and the
@@ -47,6 +48,7 @@ class CacheTTL(StrEnum):
 
 DEFAULT_TTLS: dict[Breakpoint, CacheTTL] = {
     Breakpoint.SYSTEM: CacheTTL.LONG,
+    Breakpoint.PROJECT_LAW: CacheTTL.LONG,
     Breakpoint.CODEBASE_MAP: CacheTTL.LONG,
     Breakpoint.ACCUMULATED_HISTORY: CacheTTL.SHORT,
     Breakpoint.CURRENT_TURN: CacheTTL.NONE,
@@ -107,14 +109,16 @@ class AssembledPrompt:
     def block(self, breakpoint: Breakpoint) -> Block | None:
         return next((b for b in self.blocks if b.breakpoint is breakpoint), None)
 
+    #: The system region, in assembly order. Everything ahead of history that
+    #: carries text: a provider concatenates these into one system message.
+    _STATIC = (Breakpoint.SYSTEM, Breakpoint.PROJECT_LAW, Breakpoint.CODEBASE_MAP)
+
     @property
     def static_blocks(self) -> tuple[Block, ...]:
-        """SYSTEM + CODEBASE MAP: the provider-agnostic system region."""
-        return tuple(
-            b
-            for b in self.blocks
-            if b.breakpoint in (Breakpoint.SYSTEM, Breakpoint.CODEBASE_MAP)
-        )
+        """SYSTEM + PROJECT LAW + CODEBASE MAP: the provider-agnostic system
+        region. Order is taken from `blocks`, which `__post_init__` has already
+        verified against ASSEMBLY_ORDER — never from the tuple above."""
+        return tuple(b for b in self.blocks if b.breakpoint in self._STATIC)
 
     @property
     def current_turn(self) -> str:
@@ -181,6 +185,7 @@ class PromptBuilder:
     keyring: CacheKeyring
     system_text: str
     caching_enabled: bool = True
+    _law_text: str = field(default="", init=False)
     _codebase_text: str = field(default="", init=False)
     _history: list[Turn] = field(default_factory=list, init=False)
     _prefix_log: list[str] = field(default_factory=list, init=False)
@@ -200,6 +205,16 @@ class PromptBuilder:
                 f"every call to a node (PRD T8) — something dynamic (a timestamp, a "
                 f"run_id, a task description) has leaked into the system layer."
             )
+
+    def set_project_law(self, text: str) -> None:
+        """Install the PROJECT LAW block (spec, roadmap, memory).
+
+        No freshness assertion, unlike `set_codebase_map`: law's cache key is
+        derived from its own text (`CacheKeyring.law_key`), so a stale render
+        cannot be served under a current key. There is nothing for a caller to
+        get wrong and therefore nothing to assert.
+        """
+        self._law_text = text
 
     def set_codebase_map(self, text: str, *, require_fresh: bool = True) -> None:
         """Install the codebase map / context handle block.
@@ -232,6 +247,15 @@ class PromptBuilder:
                 ttl=self._ttl(Breakpoint.SYSTEM),
             )
         ]
+        if self._law_text:
+            blocks.append(
+                Block(
+                    breakpoint=Breakpoint.PROJECT_LAW,
+                    text=self._law_text,
+                    cache_key=self.keyring.law_key(self._law_text),
+                    ttl=self._ttl(Breakpoint.PROJECT_LAW),
+                )
+            )
         if self._codebase_text:
             blocks.append(
                 Block(

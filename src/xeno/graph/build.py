@@ -78,6 +78,7 @@ from xeno.graph.checkpoints import CheckpointKind, checkpoint_step, rollback_ste
 from xeno.graph.chiron import make_chiron_node
 from xeno.graph.daedalus import make_daedalus_node
 from xeno.graph.lachesis import MAX_PLAN_OBJECTIONS, make_lachesis_nodes
+from xeno.graph.law import ProjectLaw
 from xeno.graph.odysseus import make_odysseus_node
 from xeno.graph.talos import make_talos_node
 from xeno.graph.toolchain import ToolchainSession
@@ -221,6 +222,10 @@ def build_graph(
 ) -> CompiledStateGraph[AgentState, Any, Any, Any]:
     """Compile the eight-node graph."""
     touched_files: list[Path] = []
+    #: Read from the real repo, not the worktree: memory.md is project
+    #: state that outlives any single run, so it lives beside runs/ and
+    #: worktrees/ rather than inside the disposable copy.
+    law = ProjectLaw(repo_root=repo_root)
     ctx = _LoopContext(worktree)
     breaker_panel = BreakerPanel(config.limits)
 
@@ -244,6 +249,7 @@ def build_graph(
         keyring=keyring,
         paths=paths,
         worktree=worktree,
+        law=law,
         publish_skeleton=ctx.set_skeleton,
     )
     odysseus = make_odysseus_node(
@@ -251,6 +257,7 @@ def build_graph(
         config=config,
         keyring=keyring,
         paths=paths,
+        law=law,
         skeleton=ctx.get_skeleton,
     )
     lachesis_expand, lachesis_verify = make_lachesis_nodes(
@@ -259,6 +266,7 @@ def build_graph(
         keyring=keyring,
         paths=paths,
         worktree=worktree,
+        law=law,
         touched_files=touched_files,
         toolchain_established=lambda: session.toolchain.established,
         report_refused=ctx.set_lachesis_result,
@@ -269,6 +277,7 @@ def build_graph(
         keyring=keyring,
         paths=paths,
         worktree=worktree,
+        law=law,
         touched_files=touched_files,
         report_refused=ctx.set_daedalus_result,
         last_refusal=ctx.take_daedalus_refusal,
@@ -279,6 +288,7 @@ def build_graph(
         keyring=keyring,
         paths=paths,
         worktree=worktree,
+        law=law,
         touched_files=touched_files,
         report_declined=ctx.set_chiron_result,
         last_refusal=ctx.take_refusal,
@@ -301,6 +311,7 @@ def build_graph(
         keyring=keyring,
         paths=paths,
         worktree=worktree,
+        law=law,
         initial_sha=initial_sha,
     )
 

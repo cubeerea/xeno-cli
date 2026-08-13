@@ -30,6 +30,7 @@ from xeno.core.config import XenoConfig
 from xeno.core.paths import RunPaths
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import NodeRole, Verdict
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import complete_with_format_retry
 from xeno.graph.plan import Plan, PlanTask, read_plan, write_plan
 from xeno.graph.prompts import (
@@ -96,6 +97,7 @@ def make_cerberus_node(
     keyring: CacheKeyring,
     paths: RunPaths,
     worktree: Path,
+    law: ProjectLaw,
     initial_sha: str,
 ) -> Callable[[AgentState], AgentState]:
     """Build the Cerberus node. `initial_sha` (from `vcs.init_repo`, PRD S13)
@@ -129,6 +131,7 @@ def make_cerberus_node(
             state.review_verdict = Verdict.ESCALATE
             return state
 
+        builder.set_project_law(law.render(state))
         assert state.plan is not None, "E15 only happens once a plan exists"
         plan = read_plan(state.plan)
         current_turn = _build_current_turn(state, plan, diff_text)

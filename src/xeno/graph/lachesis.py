@@ -41,6 +41,7 @@ from xeno.core.runlog import EventKind
 from xeno.core.state import AgentState, Handle
 from xeno.core.types import GateProfile, NodeRole
 from xeno.graph.context import build_codebase_map
+from xeno.graph.law import ProjectLaw
 from xeno.graph.nodeops import (
     WorktreeEscape,
     complete_with_format_retry,
@@ -256,6 +257,7 @@ def make_lachesis_nodes(
     keyring: CacheKeyring,
     paths: RunPaths,
     worktree: Path,
+    law: ProjectLaw,
     touched_files: list[Path],
     toolchain_established: Callable[[], bool],
     report_refused: Callable[[bool], None],
@@ -288,7 +290,10 @@ def make_lachesis_nodes(
         # focus: this node's whole advantage over planning up front is that it
         # can see what actually got built, and a narrowed view would give that
         # back.
-        del state
+        #
+        # Serves both jobs, so law and map stay in lockstep across expand and
+        # verify — the two calls that must agree on what "done" means.
+        builder.set_project_law(law.render(state))
         builder.set_codebase_map(build_codebase_map(worktree), require_fresh=False)
 
     def expand(state: AgentState) -> AgentState:
