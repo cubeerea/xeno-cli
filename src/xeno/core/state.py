@@ -298,6 +298,25 @@ class AgentState(BaseModel):
     #: counters describes what happened.
     plan_objection_count: int = 0
 
+    #: The human's decision at the sole gate (PRD S8.1), or `None` when the
+    #: run never reached it — Cerberus ESCALATEd, or the graph halted. The
+    #: absence is meaningful and is why this is not a plain bool: "nobody was
+    #: asked" and "somebody said no" produce the same exit code and must not
+    #: produce the same record.
+    human_approved: bool | None = None
+
+    #: Why the human declined, in their own words. Optional even on a
+    #: rejection: a gate that will not let you leave without writing an essay
+    #: gets an essay that says "no", and a required field full of "no" is
+    #: worse than an empty one because it looks like data.
+    #:
+    #: Inline rather than a Handle, like `commit_message` and
+    #: `plan_objection`. Human text is the one input to this field that has
+    #: no idea a 4 KB limit exists, so `xeno.cli` caps it at the prompt: a
+    #: ValidationError thrown after someone has typed a paragraph loses the
+    #: paragraph, and the paragraph is the entire point of asking.
+    human_objection: str | None = None
+
     @model_validator(mode="after")
     def _enforce_field_size(self) -> Self:
         """PRD S6.3 hard rule: no field may exceed 4 KB serialized."""

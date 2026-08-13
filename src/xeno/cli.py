@@ -19,7 +19,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -40,7 +40,7 @@ from xeno.core.config import (
 from xeno.core.ledger import CostLedger
 from xeno.core.paths import RunPaths, new_run_id, run_branch_name
 from xeno.core.runlog import EventKind, RunLog
-from xeno.core.state import AgentState, Handle
+from xeno.core.state import MAX_FIELD_BYTES, AgentState, Handle, stable_json
 from xeno.core.types import CALLSIGNS, NodeRole, Tier, Verdict
 from xeno.graph.build import run_graph
 from xeno.graph.spec import SpecAbandoned, run_spec_conversation, spec_chain_error
@@ -591,7 +591,15 @@ def _execute(
             stack,
             repo_root=repo_root,
             state_goal=goal,
-            succeeded=lambda: bool(final_state and final_state.review_verdict is Verdict.APPROVE),
+            # A review that passed and a human who then said no is not a
+            # successful run, however green the graph was. `human_approved`
+            # is None when nobody was asked (ESCALATE, or a halt), and the
+            # verdict alone decides those.
+            succeeded=lambda: bool(
+                final_state
+                and final_state.review_verdict is Verdict.APPROVE
+                and final_state.human_approved is not False
+            ),
             keyring_on_worktree=True,
             observer=view.handle,
             command="run",
@@ -685,11 +693,33 @@ def _execute(
                 repo_root=repo_root,
             )
 
-    assert final_state is not None
-    _print_run_summary(final_state, worktree)
-    _print_ledger_summary(ctx.ledger, ctx.ledger.write(ctx.paths.cost))
+        branch = run_branch_name(config.git.branch_prefix, goal, ctx.run_id)
 
-    branch = run_branch_name(config.git.branch_prefix, goal, ctx.run_id)
+        # All of this is inside the stack now, where it used to sit after it.
+        # The gate has to be, so the log is still open when the only person
+        # in the loop finally says something — and once the gate moved, the
+        # summary and the cost had to come with it, because asking someone to
+        # approve a change before showing them what the run did or what it
+        # spent is a worse question. Nothing registered on the stack bills
+        # anything, so the ledger is complete at this point.
+        _print_run_summary(final_state, worktree)
+        _print_ledger_summary(ctx.ledger, ctx.ledger.write(ctx.paths.cost))
+
+        # `succeeded` is evaluated at teardown, i.e. after this, which is what
+        # lets RUN_END report the human's verdict rather than Cerberus's.
+        # Those two disagree exactly when a review passed and a person said no
+        # anyway, and that is the case a log most has to get right.
+        if final_state.review_verdict is Verdict.APPROVE:
+            _human_gate(final_state, branch)
+            runlog.event(
+                EventKind.HUMAN_GATE,
+                approved=final_state.human_approved,
+                # Recorded verbatim and NOT redacted: it is the human's own
+                # words, typed at this terminal, not model output or
+                # repository content. Empty when they declined to say.
+                reason=final_state.human_objection or "",
+            )
+
     raise typer.Exit(code=_finalize(final_state, config, worktree, branch))
 
 
@@ -820,10 +850,16 @@ def _finalize(
 ) -> int:
     """The post-graph disposition (PRD S8.1, S8.4), returning the process
     exit code rather than raising, so the decision stays testable
-    independently of Typer."""
+    independently of Typer.
+
+    Reads the human's answer off `state`; `_execute` asks for it earlier,
+    while the run log is still open. This function only acts on it.
+    """
     if state.review_verdict is Verdict.APPROVE:
-        if _human_gate(state, worktree, branch) != "approve":
+        if not state.human_approved:
             console.print(f"[yellow]declined by human — branch preserved, un-squashed:[/] {branch}")
+            if state.human_objection:
+                console.print(Panel(state.human_objection, title="stated reason"))
             return 1
         assert state.commit_message is not None
         vcs.squash_to_one_commit(
@@ -874,7 +910,35 @@ def _run_succeeded(state: AgentState) -> bool:
     return not state.halted and state.task_count > 0 and state.task_cursor >= state.task_count
 
 
-def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["approve", "reject"]:
+def bound_objection(text: str) -> str:
+    """Fit a person's typing inside `MAX_FIELD_BYTES` without losing the run.
+
+    AgentState validates field size at construction, so an over-long string
+    assigned here would raise AFTER the human has finished typing — and the
+    typing is the entire reason the prompt exists. Truncating on a whitespace
+    boundary and saying so keeps the first, most specific sentences, which is
+    where a reason of any length puts its actual content.
+
+    The budget is measured against the JSON encoding, matching the validator:
+    quotes, escapes, and multi-byte characters all count there, and a cap
+    computed on `len(text)` would pass here and fail two lines later on any
+    objection containing an em dash.
+    """
+    stripped = text.strip()
+    if len(stable_json(stripped).encode()) <= MAX_FIELD_BYTES:
+        return stripped
+
+    marker = "\n[truncated]"
+    # Shrink until the ENCODED form fits. A binary search would be faster and
+    # this runs once per run, at human typing speed, against 4 KB.
+    kept = stripped
+    while kept and len(stable_json(kept + marker).encode()) > MAX_FIELD_BYTES:
+        cut = kept.rfind(" ", 0, len(kept) - 1)
+        kept = kept[: cut if cut > 0 else len(kept) - 1].rstrip()
+    return kept + marker
+
+
+def _human_gate(state: AgentState, branch: str) -> None:
     """The one human confirmation the whole system ever asks for (PRD S8.1):
     reached only on Cerberus's own APPROVE. This is a genuine veto distinct
     from Cerberus's REJECT_AND_RETURN — REJECT_AND_RETURN already happened
@@ -882,6 +946,18 @@ def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["appr
     graph; a human "reject" here does not — it leaves the branch preserved
     exactly like an ESCALATE, since APPROVE having already happened means
     there is nothing left to route back into.
+
+    Which is exactly why the rejection is now asked to explain itself. This
+    gate is the only point in the entire system where a person's judgement
+    enters, and until now it recorded a single bit — so the one thing the
+    harness could never learn was the one thing only a human knew. The reason
+    goes to state and to the run log; what later reads it is
+    `.xeno/memory.md`, not this run, which has nothing left to route into.
+
+    Mutates `state` rather than returning a verdict: the decision has to
+    outlive this call to reach the run log, the run summary, and RUN_END's
+    `succeeded`, and threading it back through three call sites as a return
+    value made each of them a place it could be dropped.
     """
     assert state.review_diff_handle is not None
     assert state.cerberus_notes is not None
@@ -900,7 +976,31 @@ def _human_gate(state: AgentState, worktree: Path, branch: str) -> Literal["appr
             with console.pager():
                 console.print(state.review_diff_handle.read_text())
             continue
-        return "approve" if choice == "approve" else "reject"
+        break
+
+    if choice == "approve":
+        state.human_approved = True
+        return
+
+    state.human_approved = False
+    console.print(
+        "\n[dim]What was wrong with it? One or two sentences. This is kept and "
+        "read by later runs; press Enter to skip.[/]"
+    )
+    try:
+        raw = Prompt.ask("reason", default="").strip()
+    except (KeyboardInterrupt, EOFError):
+        # Declining to explain is not declining to reject. The verdict is
+        # already recorded above, and losing it here would silently ship a
+        # change the human just refused.
+        raw = ""
+
+    if not raw:
+        return
+    bounded = bound_objection(raw)
+    if bounded != raw:
+        _warn(f"reason truncated to {MAX_FIELD_BYTES} bytes (PRD S6.3); the opening is kept.")
+    state.human_objection = bounded
 
 
 def _print_diff_line(handle: Handle) -> None:

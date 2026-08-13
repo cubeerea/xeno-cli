@@ -63,6 +63,13 @@ class EventKind(StrEnum):
     #: means partway through a run, so a scorecard reading this log must be
     #: able to find it without inferring it from a node name.
     TOOLCHAIN_REFRESH = "toolchain.refresh"
+    #: The human answered at the sole gate (PRD S8.1). Distinct from VERDICT,
+    #: which is Cerberus's: this is the only event in the log written by a
+    #: person, it can contradict the VERDICT immediately above it, and when
+    #: it does, it — not the VERDICT — is what the run actually decided. It
+    #: is also the only place a rejection's stated REASON is recorded, which
+    #: is the thing later runs have to learn from.
+    HUMAN_GATE = "human.gate"
 
 
 class RunLog:
